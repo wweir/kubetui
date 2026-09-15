@@ -10,14 +10,16 @@ use serde_yaml::Mapping;
 
 use crate::{
     features::{
-        api_resources::kube::SharedApiResources, network::message::NetworkRequestTargetParams,
+        api_resources::kube::SharedApiResources,
+        network::message::NetworkRequestTargetParams,
     },
     kube::KubeClientRequest,
 };
 
 use super::{
     related_resources::{to_list_value::ToListValue, RelatedClient},
-    Fetch, FetchedData,
+    Fetch,
+    FetchedData,
 };
 
 use extract::Extract;
@@ -52,7 +54,7 @@ where
     async fn fetch(&self) -> Result<FetchedData> {
         let url = format!(
             "{}/{}",
-            Ingress::url_path(&(), Some(&self.namespace)),
+            Ingress::url_path(&Default::default(), Some(&self.namespace)),
             self.name
         );
 
@@ -167,7 +169,8 @@ mod tests {
 
     use crate::{
         features::{
-            api_resources::kube::ApiResources, network::message::NetworkRequestTargetParams,
+            api_resources::kube::ApiResources,
+            network::message::NetworkRequestTargetParams,
         },
         kube::mock::MockTestKubeClient,
         mock_expect,

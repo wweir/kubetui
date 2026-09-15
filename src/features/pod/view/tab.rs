@@ -5,7 +5,11 @@ use ratatui::layout::{Constraint, Direction};
 
 use crate::{
     clipboard::Clipboard,
-    features::component_id::{POD_TAB_ID, POD_WIDGET_ID},
+    config::theme::WidgetThemeConfig,
+    features::{
+        component_id::{POD_TAB_ID, POD_WIDGET_ID},
+        pod::{PodColumns, PodLabelColumn},
+    },
     kube::context::Namespace,
     message::Message,
     ui::{
@@ -15,11 +19,20 @@ use crate::{
     },
 };
 
-use super::widgets::{log_query_help_widget, log_query_widget, log_widget, pod_widget};
+use super::widgets::{
+    log_query_help_widget,
+    log_query_widget,
+    log_widget,
+    pod_columns_dialog,
+    pod_filter_help_widget,
+    pod_widget,
+};
 
 pub struct PodTab {
     pub tab: Tab<'static>,
     pub log_query_help_dialog: Widget<'static>,
+    pub pod_columns_dialog: Widget<'static>,
+    pub pod_filter_help_dialog: Widget<'static>,
 }
 
 impl PodTab {
@@ -29,11 +42,20 @@ impl PodTab {
         clipboard: &Option<Rc<RefCell<Clipboard>>>,
         split_direction: Direction,
         namespaces: Rc<RefCell<Namespace>>,
+        default_columns: Option<PodColumns>,
+        label_registry: Vec<PodLabelColumn>,
+        theme: WidgetThemeConfig,
+        log_max_lines: Option<usize>,
     ) -> Self {
-        let pod_widget = pod_widget(tx);
-        let log_query_widget = log_query_widget(tx, namespaces);
-        let log_widget = log_widget(clipboard);
-        let log_query_help_widget = log_query_help_widget();
+        let error_theme = theme.error.clone().into();
+
+        let pod_widget = pod_widget(tx, label_registry.clone(), theme.clone());
+        let log_query_widget = log_query_widget(tx, namespaces, theme.clone());
+        let pod_columns_dialog =
+            pod_columns_dialog(tx, default_columns, label_registry, theme.clone());
+        let pod_filter_help_dialog = pod_filter_help_widget(theme.clone());
+        let log_widget = log_widget(tx, clipboard, theme.clone(), log_max_lines);
+        let log_query_help_widget = log_query_help_widget(theme);
 
         let layout = TabLayout::new(layout, split_direction);
 
@@ -42,13 +64,16 @@ impl PodTab {
             title,
             [pod_widget, log_query_widget, log_widget],
             layout,
-        );
+        )
+        .error_theme(error_theme);
 
         tab.activate_widget_by_id(POD_WIDGET_ID);
 
         Self {
             tab,
             log_query_help_dialog: log_query_help_widget,
+            pod_columns_dialog,
+            pod_filter_help_dialog,
         }
     }
 }

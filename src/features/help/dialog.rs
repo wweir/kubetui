@@ -1,9 +1,20 @@
+use ratatui::style::{Color, Modifier, Style};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
     ansi::{AnsiEscapeSequence, TextParser},
+    config::theme::ThemeConfig,
     features::component_id::HELP_DIALOG_ID,
-    ui::widget::{Text, Widget, WidgetBase},
+    ui::widget::{
+        ansi_color::style_to_ansi,
+        SearchForm,
+        SearchFormTheme,
+        Text,
+        TextTheme,
+        Widget,
+        WidgetBase,
+        WidgetTheme,
+    },
 };
 
 const LEFT_HELP_TEXT: &[HelpBlock] = &[
@@ -49,6 +60,19 @@ const LEFT_HELP_TEXT: &[HelpBlock] = &[
             KeyBindings {
                 keys: &["h", "?"],
                 desc: "Show this help",
+            },
+        ],
+    },
+    HelpBlock {
+        title: "Context Dialog",
+        bindings: &[
+            KeyBindings {
+                keys: &["Enter"],
+                desc: "switch context (use cached namespaces)",
+            },
+            KeyBindings {
+                keys: &["Ctrl-Space"],
+                desc: "switch context (preserve current namespaces)",
             },
         ],
     },
@@ -155,7 +179,7 @@ const RIGHT_HELP_TEXT: &[HelpBlock] = &[
         ],
     },
     HelpBlock {
-        title: "List / Yaml Tab",
+        title: "API / Yaml Tab",
         bindings: &[KeyBindings {
             keys: &["f"],
             desc: "open select dialog",
@@ -200,11 +224,45 @@ const RIGHT_HELP_TEXT: &[HelpBlock] = &[
         ],
     },
     HelpBlock {
-        title: "Log",
+        title: "Pod",
         bindings: &[KeyBindings {
-            keys: &["Enter"],
-            desc: "insert blank line",
+            keys: &["t"],
+            desc: "customize visible columns",
         }],
+    },
+    HelpBlock {
+        title: "Log",
+        bindings: &[
+            KeyBindings {
+                keys: &["Enter"],
+                desc: "insert blank line",
+            },
+            KeyBindings {
+                keys: &["f", "p"],
+                desc: "toggle json pretty print",
+            },
+        ],
+    },
+    HelpBlock {
+        title: "Pod Columns",
+        bindings: &[
+            KeyBindings {
+                keys: &["j", "k", "Up", "Down"],
+                desc: "move cursor up/down",
+            },
+            KeyBindings {
+                keys: &["g", "G", "Home", "End"],
+                desc: "move cursor to the first/last line",
+            },
+            KeyBindings {
+                keys: &["Space", "Enter"],
+                desc: "toggle column visibility",
+            },
+            KeyBindings {
+                keys: &["J", "K"],
+                desc: "move column up/down",
+            },
+        ],
     },
 ];
 
@@ -229,64 +287,57 @@ struct HelpBlock {
     bindings: &'static [KeyBindings],
 }
 
-impl HelpBlock {
-    fn print(&self) -> Vec<String> {
-        let mut block = Vec::new();
+fn print_help_block(block: &HelpBlock, theme: &HelpItemTheme) -> Vec<String> {
+    let mut line = Vec::new();
 
-        block.push(format!("\x1b[1m[ {} ]\x1b[0m", self.title));
+    line.push(format!(
+        "{}[ {} ]\x1b[39m",
+        style_to_ansi(theme.title_style),
+        block.title
+    ));
 
-        let max_key_len = self
-            .bindings
-            .iter()
-            .map(|b| b.keys().width())
-            .max()
-            .expect("no bindings");
+    let max_key_len = block
+        .bindings
+        .iter()
+        .map(|b| b.keys().width())
+        .max()
+        .expect("no bindings");
 
-        let lines: Vec<String> = self
-            .bindings
-            .iter()
-            .map(|b| {
-                format!(
-                    "\x1b[96m{:>pad$}:\x1b[0m {}",
-                    b.keys(),
-                    b.desc(),
-                    pad = max_key_len
-                )
-            })
-            .collect();
+    let lines: Vec<String> = block
+        .bindings
+        .iter()
+        .map(|b| {
+            format!(
+                "{}{:>pad$}:\x1b[39m {}{}",
+                style_to_ansi(theme.key_style),
+                b.keys(),
+                style_to_ansi(theme.desc_style),
+                b.desc(),
+                pad = max_key_len
+            )
+        })
+        .collect();
 
-        block.extend(lines);
+    line.extend(lines);
 
-        block
-    }
+    line
 }
 
-#[derive(Clone)]
-struct HelpText {
-    blocks: Vec<HelpBlock>,
+fn print_help_blocks(blocks: &[HelpBlock], theme: &HelpItemTheme) -> Vec<String> {
+    blocks
+        .iter()
+        .flat_map(|block| {
+            let mut lines = print_help_block(block, theme);
+            lines.push("".to_string());
+            lines
+        })
+        .collect()
 }
 
-impl HelpText {
-    fn new(blocks: Vec<HelpBlock>) -> Self {
-        Self { blocks }
-    }
+fn generate(theme: HelpItemTheme) -> Vec<String> {
+    let mut left = print_help_blocks(LEFT_HELP_TEXT, &theme);
 
-    fn print(&self) -> Vec<String> {
-        self.blocks
-            .iter()
-            .flat_map(|b| {
-                let mut b = b.print();
-                b.push("".to_string());
-                b
-            })
-            .collect()
-    }
-}
-
-fn generate() -> Vec<String> {
-    let mut left = HelpText::new(LEFT_HELP_TEXT.to_vec()).print();
-
-    let mut right = HelpText::new(RIGHT_HELP_TEXT.to_vec()).print();
+    let mut right = print_help_blocks(RIGHT_HELP_TEXT, &theme);
 
     let len = left.len().max(right.len());
 
@@ -310,9 +361,11 @@ fn generate() -> Vec<String> {
         .zip(right)
         .map(|(l, r)| {
             // 制御文字のascii文字を計算して調整
-            let escape_len = l.ansi_parse().fold(0, |len, p| match p.ty {
-                AnsiEscapeSequence::Chars => len,
-                _ => len + p.chars.len(),
+            let escape_len = l.ansi_parse().fold(0, |len, p| {
+                match p.ty {
+                    AnsiEscapeSequence::Chars => len,
+                    _ => len + p.chars.len(),
+                }
             });
 
             let pad = view_padding + escape_len;
@@ -321,18 +374,50 @@ fn generate() -> Vec<String> {
         .collect()
 }
 
+#[derive(Clone)]
+pub struct HelpItemTheme {
+    pub title_style: Style,
+    pub key_style: Style,
+    pub desc_style: Style,
+}
+
+impl Default for HelpItemTheme {
+    fn default() -> Self {
+        Self {
+            title_style: Style::default().add_modifier(Modifier::BOLD),
+            key_style: Style::default().fg(Color::LightCyan),
+            desc_style: Style::default(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct HelpDialog {
     pub widget: Widget<'static>,
 }
 
 impl HelpDialog {
-    pub fn new() -> Self {
+    pub fn new(theme: ThemeConfig) -> Self {
+        let widget_theme = WidgetTheme::from(theme.component.clone());
+        let text_theme = TextTheme::from(theme.component.clone());
+        let search_theme = SearchFormTheme::from(theme.component.clone());
+
+        let widget_base = WidgetBase::builder()
+            .title("Help")
+            .theme(widget_theme)
+            .build();
+
+        let search_form = SearchForm::builder().theme(search_theme).build();
+
+        let item_theme = HelpItemTheme::from(theme.help.clone());
+
         Self {
             widget: Text::builder()
                 .id(HELP_DIALOG_ID)
-                .widget_base(WidgetBase::builder().title("Help").build())
-                .items(generate())
+                .widget_base(widget_base)
+                .search_form(search_form)
+                .theme(text_theme)
+                .items(generate(item_theme))
                 .build()
                 .into(),
         }

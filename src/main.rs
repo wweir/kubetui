@@ -2,6 +2,8 @@ mod ansi;
 mod app;
 mod clipboard;
 mod cmd;
+mod config;
+mod error;
 mod features;
 mod kube;
 mod logging;
@@ -19,7 +21,7 @@ use ratatui::crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
-use crate::{app::App, cmd::Command, logging::Logger};
+use crate::{app::App, cmd::Command, config::Config, logging::Logger};
 
 macro_rules! enable_raw_mode {
     () => {
@@ -72,13 +74,21 @@ fn main() -> Result<()> {
 
     let command = Command::init();
 
+    if let Some(subcommand) = command.subcommand {
+        return subcommand.run();
+    }
+
     if command.logging {
         Logger::init()?;
     }
 
+    let config_load_option = command.config_load_option()?;
+
+    let config = Config::load(config_load_option)?;
+
     enable_raw_mode!();
 
-    let result = App::run(command);
+    let result = App::run(command, config);
 
     disable_raw_mode!();
 

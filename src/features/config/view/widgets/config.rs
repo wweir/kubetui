@@ -1,42 +1,78 @@
 use crossbeam::channel::Sender;
 
 use crate::{
+    config::theme::WidgetThemeConfig,
     features::{
         component_id::{CONFIG_RAW_DATA_WIDGET_ID, CONFIG_WIDGET_ID},
-        config::message::{ConfigRequest, RequestData},
+        config::{
+            config_filter_applicator,
+            message::{ConfigRequest, RequestData},
+            ConfigLabelColumn,
+        },
     },
     message::Message,
     ui::{
         event::EventResult,
-        widget::{Table, TableItem, Widget, WidgetBase, WidgetTrait as _},
-        Window, WindowAction,
+        widget::{
+            FilterForm,
+            FilterFormTheme,
+            Table,
+            TableItem,
+            TableTheme,
+            Widget,
+            WidgetBase,
+            WidgetTheme,
+            WidgetTrait as _,
+        },
+        Window,
+        WindowAction,
     },
 };
 
-pub fn config_widget(tx: &Sender<Message>) -> Widget<'static> {
+pub fn config_widget(
+    tx: &Sender<Message>,
+    label_registry: Vec<ConfigLabelColumn>,
+    theme: WidgetThemeConfig,
+) -> Widget<'static> {
     let tx = tx.clone();
+
+    let widget_theme = WidgetTheme::from(theme.clone());
+    let filter_theme = FilterFormTheme::from(theme.clone());
+    let table_theme = TableTheme::from(theme.clone());
+
+    let widget_base = WidgetBase::builder()
+        .title("Config")
+        .theme(widget_theme)
+        .build();
+
+    let filter_form = FilterForm::builder().theme(filter_theme).build();
 
     Table::builder()
         .id(CONFIG_WIDGET_ID)
-        .widget_base(WidgetBase::builder().title("Config").build())
-        .filtered_key("NAME")
+        .widget_base(widget_base)
+        .filter_form(filter_form)
+        .theme(table_theme)
+        .filter_applicator(config_filter_applicator(label_registry, tx.clone()))
+        .action('t', open_config_columns_dialog())
         .block_injection(block_injection())
         .on_select(on_select(tx))
         .build()
         .into()
 }
 
+fn open_config_columns_dialog() -> impl Fn(&mut Window) -> EventResult {
+    use crate::features::component_id::CONFIG_COLUMNS_DIALOG_ID;
+    |w: &mut Window| {
+        w.open_dialog(CONFIG_COLUMNS_DIALOG_ID);
+        EventResult::Nop
+    }
+}
+
 fn block_injection() -> impl Fn(&Table) -> WidgetBase {
     |table: &Table| {
-        let index = if let Some(index) = table.state().selected() {
-            index + 1
-        } else {
-            0
-        };
-
         let mut base = table.widget_base().clone();
 
-        *base.append_title_mut() = Some(format!(" [{}/{}]", index, table.items().len()).into());
+        *base.append_title_mut() = Some(table.count_indicator().into());
 
         base
     }

@@ -1,4 +1,5 @@
 mod log_collector;
+mod log_content;
 mod log_streamer;
 mod pod_watcher;
 
@@ -17,10 +18,11 @@ use kube::Api;
 use tokio::task::{JoinError, JoinHandle};
 
 use crate::{
+    features::pod::message::LogMessage,
     kube::{context::Namespace, KubeClient},
     logger,
     message::Message,
-    workers::kube::{AbortWorker, Worker},
+    workers::kube::{InfiniteWorker, Worker},
 };
 
 pub use self::log_streamer::LogPrefixType;
@@ -32,29 +34,26 @@ use self::{
     pod_watcher::{PodWatcher, PodWatcherFilter, PodWatcherSelector},
 };
 
-#[macro_export]
-macro_rules! send_response {
-    ($tx:expr, $msg:expr) => {
-        use $crate::features::pod::message::LogMessage;
-
-        $tx.send(LogMessage::Response($msg).into())
-            .expect("Failed to send LogMessage::Response");
-    };
-}
-
 #[derive(Debug, Clone)]
 pub struct LogConfig {
-    namespaces: Namespace,
-    query: String,
-    prefix_type: LogPrefixType,
+    pub namespaces: Namespace,
+    pub query: String,
+    pub prefix_type: LogPrefixType,
+    pub json_pretty_print: bool,
 }
 
 impl LogConfig {
-    pub fn new(query: String, namespaces: Namespace, prefix_type: LogPrefixType) -> Self {
+    pub fn new(
+        query: String,
+        namespaces: Namespace,
+        prefix_type: LogPrefixType,
+        json_pretty_print: bool,
+    ) -> Self {
         Self {
             namespaces,
             query,
             prefix_type,
+            json_pretty_print,
         }
     }
 }
@@ -63,7 +62,7 @@ impl LogConfig {
 pub struct LogWorker {
     tx: Sender<Message>,
     client: KubeClient,
-    config: LogConfig,
+    pub config: LogConfig,
 }
 
 impl LogWorker {
@@ -87,7 +86,27 @@ impl LogWorker {
                 let retrieve_label_selector =
                     RetrieveLabelSelector::new(&self.client, &namespace, value);
 
-                Some(retrieve_label_selector.retrieve().await?)
+                match retrieve_label_selector.retrieve().await {
+                    Ok(sel) => Some(sel),
+                    Err(e) => {
+                        let selector_display = match value {
+                            LabelSelector::Resource(r) => r.to_string(),
+                            LabelSelector::String(s) => s.clone(),
+                        };
+                        let notice = LogMessage::Notice {
+                            namespace: namespace.clone(),
+                            message: format!(
+                                "failed to retrieve label selector for {}: {}",
+                                selector_display, e
+                            ),
+                        };
+                        if let Err(send_err) = self.tx.send(notice.into()) {
+                            logger!(error, "Failed to send LogMessage::Notice: {}", send_err);
+                            return Ok(LogHandle::new(Vec::new()));
+                        }
+                        continue;
+                    }
+                }
             } else {
                 None
             };
@@ -120,7 +139,13 @@ impl LogWorker {
         let mut handles: Vec<_> = pod_watchers.iter().map(PodWatcher::spawn).collect();
 
         // collector
-        let collector_handle = LogCollector::new(self.tx.clone(), log_buffer.clone()).spawn();
+        let collector_handle = LogCollector::new(
+            self.tx.clone(),
+            log_buffer.clone(),
+            self.config.json_pretty_print,
+            filter.json_filter,
+        )
+        .spawn();
 
         handles.push(collector_handle);
 
@@ -130,17 +155,28 @@ impl LogWorker {
 }
 
 #[async_trait]
-impl AbortWorker for LogWorker {
+impl InfiniteWorker for LogWorker {
     async fn run(&self) {
         match Filter::parse(&self.config.query) {
             Ok(filter) => {
+                // Send SetMaxLines message if limit is specified in the query
+                if filter.limit.is_some() {
+                    if let Err(e) = self.tx.send(LogMessage::SetMaxLines(filter.limit).into()) {
+                        logger!(error, "Failed to send LogMessage::SetMaxLines: {}", e);
+                        return;
+                    }
+                }
+
                 match self.spawn_tasks(filter).await {
                     Ok(mut handles) => {
                         handles.join().await;
                     }
                     Err(err) => {
                         logger!(error, "{}", err);
-                        send_response!(self.tx, Err(anyhow!(err)));
+                        if let Err(e) = self.tx.send(LogMessage::Response(Err(anyhow!(err))).into())
+                        {
+                            logger!(error, "Failed to send LogMessage::Response: {}", e);
+                        }
                     }
                 };
             }
@@ -149,13 +185,15 @@ impl AbortWorker for LogWorker {
 
                 let msg = indoc::formatdoc! {r#"
                        {err}
-                       Invalid query.
-                       You can display the help dialog by entering "?" or "help" in the log query form.
+
+                       Tip: Enter "?" or "help" in the log query form for syntax guidance.
                    "#,
                    err = err
                 };
 
-                send_response!(self.tx, Err(anyhow!(msg)));
+                if let Err(e) = self.tx.send(LogMessage::Response(Err(anyhow!(msg))).into()) {
+                    logger!(error, "Failed to send LogMessage::Response: {}", e);
+                }
             }
         }
     }

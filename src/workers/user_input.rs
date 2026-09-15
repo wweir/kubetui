@@ -1,10 +1,4 @@
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::time::Duration;
 
 use anyhow::Result;
 use crossbeam::channel::Sender;
@@ -20,36 +14,42 @@ use crate::{
 /// イベントデータはチャネルを介してメインスレッドに送信される
 pub struct UserInput {
     tx: Sender<Message>,
-    is_terminated: Arc<AtomicBool>,
+    tx_shutdown: Sender<Result<()>>,
 }
 
 impl UserInput {
-    pub fn new(tx: Sender<Message>, is_terminated: Arc<AtomicBool>) -> Self {
-        Self { tx, is_terminated }
+    pub fn new(tx: Sender<Message>, tx_shutdown: Sender<Result<()>>) -> Self {
+        Self { tx, tx_shutdown }
     }
 
-    pub fn start(&self) -> Result<()> {
+    pub fn start(&self) {
         logger!(info, "user_input start");
 
         let ret = self.poll();
 
-        self.is_terminated.store(true, Ordering::Relaxed);
+        if let Err(e) = &ret {
+            logger!(error, "{}", e);
+        }
 
         logger!(info, "user_input end");
 
-        ret
+        self.tx_shutdown
+            .send(ret)
+            .expect("failed to send shutdown signal");
     }
 
     pub fn set_panic_hook(&self) {
-        let is_terminated = self.is_terminated.clone();
+        let tx_shutdown = self.tx_shutdown.clone();
 
         panic_set_hook!({
-            is_terminated.store(true, Ordering::Relaxed);
+            tx_shutdown
+                .send(Err(anyhow::anyhow!("panic occurred in UserInput worker")))
+                .expect("failed to send shutdown signal");
         });
     }
 
     fn poll(&self) -> Result<()> {
-        while !self.is_terminated.load(Ordering::Relaxed) {
+        loop {
             if let Ok(true) = poll(Duration::from_secs(1)) {
                 let ev = read()?;
 
@@ -73,7 +73,5 @@ impl UserInput {
                 }
             }
         }
-
-        Ok(())
     }
 }

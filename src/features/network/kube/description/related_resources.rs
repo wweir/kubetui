@@ -104,27 +104,30 @@ pub mod label_selector {
                 ret
             };
 
-            requirements
-                .iter()
-                .all(|requirement| match requirement.operator.as_str() {
+            requirements.iter().all(|requirement| {
+                match requirement.operator.as_str() {
                     // A In [B, ..]
                     // Aの値が[B, ..]のいずれか1つ以上と一致する場合にtrue
-                    "In" => requirement.values.as_ref().map_or(false, |values| {
-                        values.iter().any(|value| {
-                            let r = BTreeMap::from([(requirement.key.clone(), value.clone())]);
+                    "In" => {
+                        requirement.values.as_ref().is_some_and(|values| {
+                            values.iter().any(|value| {
+                                let r = BTreeMap::from([(requirement.key.clone(), value.clone())]);
 
-                            labels.contains_key_values(&r)
+                                labels.contains_key_values(&r)
+                            })
                         })
-                    }),
+                    }
                     // A NotIn [B, ..]
                     // Aの値が[B, ..]のいずれとも一致しない場合にtrue
-                    "NotIn" => requirement.values.as_ref().map_or(false, |values| {
-                        values.iter().all(|value| {
-                            let r = BTreeMap::from([(requirement.key.clone(), value.clone())]);
+                    "NotIn" => {
+                        requirement.values.as_ref().is_some_and(|values| {
+                            values.iter().all(|value| {
+                                let r = BTreeMap::from([(requirement.key.clone(), value.clone())]);
 
-                            !labels.contains_key_values(&r)
+                                !labels.contains_key_values(&r)
+                            })
                         })
-                    }),
+                    }
                     // A Exists []
                     // Aが存在する場合にtrue
                     "Exists" => labels.contains_key(&requirement.key),
@@ -134,7 +137,8 @@ pub mod label_selector {
                     _ => {
                         unreachable!()
                     }
-                })
+                }
+            })
         }
     }
 
@@ -279,10 +283,8 @@ mod btree_map_contains_key_values {
         V: PartialEq,
     {
         fn contains_key_values(&self, arg: &BTreeMap<K, V>) -> bool {
-            arg.iter().all(|(arg_key, arg_value)| {
-                self.get(arg_key)
-                    .map_or(false, |self_value| self_value == arg_value)
-            })
+            arg.iter()
+                .all(|(arg_key, arg_value)| self.get(arg_key) == Some(arg_value))
         }
     }
 
@@ -338,13 +340,13 @@ mod fetch {
         }
     }
 
-    impl<'a, C: KubeClientRequest> FetchClient<'_, C> {
+    impl<C: KubeClientRequest> FetchClient<'_, C> {
         pub async fn fetch<K>(&self) -> Result<List<K>>
         where
             K: Resource<DynamicType = ()> + ListableResource,
             K: DeserializeOwned + 'static,
         {
-            let url = K::url_path(&(), Some(self.namespace));
+            let url = K::url_path(&Default::default(), Some(self.namespace));
 
             self.client.request(&url).await
         }

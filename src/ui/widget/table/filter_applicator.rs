@@ -1,0 +1,513 @@
+use std::collections::HashMap;
+
+use regex::Regex;
+
+use crate::ui::widget::{styled_graphemes::StyledGraphemes, TableItem};
+
+/// A set of filter predicates that determine whether a [`TableItem`] should be
+/// shown in the table.
+///
+/// All non-empty fields are AND-combined; within `column_includes` and
+/// `column_excludes` the per-column patterns are AND-combined too, but the
+/// patterns within a single column list are OR-combined.
+///
+/// ```text
+/// result = (col_A matches include_A?) AND (col_B matches include_B?) AND …
+///        AND NOT (col_A matches exclude_A?) AND NOT (col_B matches exclude_B?) AND …
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct TableFilterPredicate {
+    /// Column-name → list of regexes, any one of which must match that column
+    /// (OR within a column, AND across columns).
+    pub column_includes: HashMap<String, Vec<Regex>>,
+
+    /// Column-name → list of regexes; if any pattern matches the column,
+    /// the row is excluded.
+    pub column_excludes: HashMap<String, Vec<Regex>>,
+
+    /// Opaque label selector string (e.g. `"app=foo,env=prod"`).
+    /// Stored for display / forwarding; NOT evaluated inside `matches()`.
+    /// Consumed by external callers (e.g. PR B Node tab on_apply hook).
+    #[allow(dead_code)]
+    pub label_selector: Option<String>,
+
+    /// Raw filter string stored for display / forwarding.
+    /// NOT evaluated inside `matches()`.
+    /// Consumed by external callers (e.g. title display in PR B).
+    #[allow(dead_code)]
+    pub raw: String,
+}
+
+impl TableFilterPredicate {
+    /// Returns `true` when this predicate is entirely empty (no filtering).
+    /// Consumed by external callers (e.g. PR B Node tab title display).
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.column_includes.is_empty()
+            && self.column_excludes.is_empty()
+            && self.label_selector.is_none()
+            && self.raw.is_empty()
+    }
+
+    /// Returns `true` when `item` passes all active filters.
+    ///
+    /// A constraint whose column is not present in `visible_columns` (e.g. the
+    /// column was hidden via the column dialog) is **inactive**: it is skipped
+    /// rather than failing the row, so the remaining visible-column constraints
+    /// still apply and rows stay visible.
+    pub fn matches(&self, item: &TableItem, visible_columns: &[String]) -> bool {
+        // --- column_includes (AND across columns, OR within) ---
+        for (column, patterns) in &self.column_includes {
+            let Some(idx) = column_index(visible_columns, column) else {
+                continue; // inactive: column not among the visible columns
+            };
+            let cell = cell_text(item, idx);
+            if !patterns.iter().any(|r| r.is_match(&cell)) {
+                return false;
+            }
+        }
+
+        // --- column_excludes (AND across columns, OR within → exclude) ---
+        for (column, patterns) in &self.column_excludes {
+            let Some(idx) = column_index(visible_columns, column) else {
+                continue; // inactive: column not among the visible columns
+            };
+            let cell = cell_text(item, idx);
+            if patterns.iter().any(|r| r.is_match(&cell)) {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+/// Normalize a column name for case/format-insensitive comparison: lowercase,
+/// with spaces, hyphens, and underscores removed. This lets `nominatednode`,
+/// `nominated-node`, and `Nominated_Node` all match the `NOMINATED NODE`
+/// header, and keeps hyphenated headers (e.g. `INTERNAL-IP`) matchable from a
+/// single whitespace-delimited token.
+pub fn normalize_column_name(s: &str) -> String {
+    s.to_lowercase().replace([' ', '-', '_'], "")
+}
+
+/// Index of the visible column whose normalized name equals `column_name`'s,
+/// or `None` if no such column is currently displayed (the constraint is inactive).
+// TODO(perf): column_index() is called per column × per row × per render. Each
+// invocation re-normalizes the column names. If profiling shows this in the
+// hot path, pre-compute a column-name → index map at filter_state set time.
+fn column_index(visible_columns: &[String], column_name: &str) -> Option<usize> {
+    let key = normalize_column_name(column_name);
+    visible_columns
+        .iter()
+        .position(|h| normalize_column_name(h) == key)
+}
+
+/// ANSI-stripped text of the cell at `idx` in `item` (empty string if missing).
+fn cell_text(item: &TableItem, idx: usize) -> String {
+    item.item
+        .get(idx)
+        .map(|c| c.styled_graphemes_symbols().concat())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Callback types and factory struct
+// ---------------------------------------------------------------------------
+
+use crate::{
+    define_callback,
+    ui::{event::EventResult, Window},
+};
+
+// TableFilterParser: parses a raw filter string into a TableFilterPredicate.
+// Returns Ok(predicate) on success, or Err(message) for display to the user.
+define_callback!(pub TableFilterParser, Fn(&str) -> Result<TableFilterPredicate, String>);
+
+// OnFilterApply: called after a filter has been applied (or cleared). Receives
+// the new predicate and a mutable Window reference for side effects (e.g.,
+// forwarding labelSelector to a poller via shared state).
+define_callback!(pub OnFilterApply, Fn(&TableFilterPredicate, &mut Window));
+
+// OnFilterCancel: called when the user cancels the filter (Esc out of
+// FilterInput or FilterConfirm). Receives only &mut Window — the predicate is
+// irrelevant at cancel time. Used by applicators that maintain server-side or
+// otherwise external state which must be cleared on cancel.
+define_callback!(pub OnFilterCancel, Fn(&mut Window));
+
+/// Controls *when* the filter is actually applied to the table rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyStrategy {
+    /// Filter is applied on every keystroke (incremental / live search).
+    Live,
+    /// Filter is applied only when the user presses Enter.
+    /// Used by Node tab (PR B); no internal consumer in PR A.
+    #[allow(dead_code)]
+    EnterToConfirm,
+}
+
+/// Bundles everything a [`Table`] widget needs to support column filtering.
+///
+/// Construct via [`TableFilterApplicator::new`] and use the builder methods to
+/// attach optional components before passing to `Table::builder().filter_applicator()`.
+pub struct TableFilterApplicator {
+    /// Converts a raw filter string into a [`TableFilterPredicate`].
+    pub(crate) parser: TableFilterParser,
+    /// Controls when the predicate is applied to the visible rows.
+    pub(crate) strategy: ApplyStrategy,
+    /// Optional dialog-id of the help overlay (opened when user presses `?`
+    /// while the filter input is focused).
+    pub(crate) help_dialog_id: Option<String>,
+    /// Optional callback invoked after the filter changes.
+    pub(crate) on_apply: Option<OnFilterApply>,
+    /// Optional callback invoked when the user cancels the filter (Esc).
+    pub(crate) on_cancel: Option<OnFilterCancel>,
+}
+
+impl std::fmt::Debug for TableFilterApplicator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TableFilterApplicator")
+            .field("strategy", &self.strategy)
+            .field("help_dialog_id", &self.help_dialog_id)
+            .field("parser", &"<TableFilterParser>")
+            .field(
+                "on_apply",
+                &self.on_apply.as_ref().map(|_| "<OnFilterApply>"),
+            )
+            .field(
+                "on_cancel",
+                &self.on_cancel.as_ref().map(|_| "<OnFilterCancel>"),
+            )
+            .finish()
+    }
+}
+
+impl TableFilterApplicator {
+    /// Create a new applicator with the given parser and apply strategy.
+    pub fn new(parser: TableFilterParser, strategy: ApplyStrategy) -> Self {
+        Self {
+            parser,
+            strategy,
+            help_dialog_id: None,
+            on_apply: None,
+            on_cancel: None,
+        }
+    }
+
+    /// Attach a help-dialog id. When the filter input is focused and the user
+    /// presses `?`, the dialog with this id will be opened.
+    /// Consumed by external callers (PR B Node tab).
+    #[allow(dead_code)]
+    pub fn with_help_dialog(mut self, id: impl Into<String>) -> Self {
+        self.help_dialog_id = Some(id.into());
+        self
+    }
+
+    /// Attach a callback that is invoked after every filter change.
+    /// Consumed by external callers (PR B Node tab on_apply for labelSelector).
+    #[allow(dead_code)]
+    pub fn with_on_apply(mut self, cb: OnFilterApply) -> Self {
+        self.on_apply = Some(cb);
+        self
+    }
+
+    /// Attach a callback invoked when the user cancels the filter (Esc out of
+    /// FilterInput or FilterConfirm). Used by applicators that have server-side
+    /// or otherwise external state which needs to be cleared on cancel. The
+    /// callback receives `&mut Window` so it can interact with other widgets or
+    /// dialogs as needed.
+    #[allow(dead_code)]
+    pub fn with_on_cancel(mut self, cb: OnFilterCancel) -> Self {
+        self.on_cancel = Some(cb);
+        self
+    }
+}
+
+// Suppress unused-import warning: EventResult is referenced by the
+// define_callback! expansion indirectly; keep the use above for correctness.
+#[allow(unused_imports)]
+use EventResult as _;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_item(cells: &[&str]) -> TableItem {
+        TableItem::new(
+            cells.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            None,
+        )
+    }
+
+    fn header(cols: &[&str]) -> Vec<String> {
+        cols.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn empty_predicate_matches_anything() {
+        let pred = TableFilterPredicate::default();
+        let item = make_item(&["foo", "bar"]);
+        let hdr = header(&["NAME", "STATUS"]);
+        assert!(pred.matches(&item, &hdr));
+    }
+
+    #[test]
+    fn includes_within_column_use_or() {
+        let mut pred = TableFilterPredicate::default();
+        pred.column_includes.insert(
+            "STATUS".to_string(),
+            vec![
+                Regex::new("Running").unwrap(),
+                Regex::new("Pending").unwrap(),
+            ],
+        );
+        let hdr = header(&["NAME", "STATUS"]);
+
+        // matches "Running"
+        assert!(pred.matches(&make_item(&["pod-a", "Running"]), &hdr));
+        // matches "Pending"
+        assert!(pred.matches(&make_item(&["pod-b", "Pending"]), &hdr));
+        // neither → rejected
+        assert!(!pred.matches(&make_item(&["pod-c", "Failed"]), &hdr));
+    }
+
+    #[test]
+    fn includes_across_columns_use_and() {
+        let mut pred = TableFilterPredicate::default();
+        pred.column_includes
+            .insert("NAME".to_string(), vec![Regex::new("web").unwrap()]);
+        pred.column_includes
+            .insert("STATUS".to_string(), vec![Regex::new("Running").unwrap()]);
+        let hdr = header(&["NAME", "STATUS"]);
+
+        // both match
+        assert!(pred.matches(&make_item(&["web-server", "Running"]), &hdr));
+        // name matches but status doesn't
+        assert!(!pred.matches(&make_item(&["web-server", "Pending"]), &hdr));
+        // status matches but name doesn't
+        assert!(!pred.matches(&make_item(&["api-server", "Running"]), &hdr));
+    }
+
+    #[test]
+    fn excludes_any_match_excludes() {
+        let mut pred = TableFilterPredicate::default();
+        pred.column_excludes.insert(
+            "STATUS".to_string(),
+            vec![Regex::new("Failed").unwrap(), Regex::new("Error").unwrap()],
+        );
+        let hdr = header(&["NAME", "STATUS"]);
+
+        assert!(pred.matches(&make_item(&["pod-a", "Running"]), &hdr));
+        assert!(!pred.matches(&make_item(&["pod-b", "Failed"]), &hdr));
+        assert!(!pred.matches(&make_item(&["pod-c", "Error"]), &hdr));
+    }
+
+    #[test]
+    fn excludes_across_columns_block_on_any_match() {
+        let mut pred = TableFilterPredicate::default();
+        pred.column_excludes
+            .insert("NAME".to_string(), vec![Regex::new("bad").unwrap()]);
+        pred.column_excludes
+            .insert("STATUS".to_string(), vec![Regex::new("Failed").unwrap()]);
+        let hdr = header(&["NAME", "STATUS"]);
+
+        // neither column excluded → passes
+        assert!(pred.matches(&make_item(&["good-pod", "Running"]), &hdr));
+        // NAME matches exclusion → rejected
+        assert!(!pred.matches(&make_item(&["bad-pod", "Running"]), &hdr));
+        // STATUS matches exclusion → rejected
+        assert!(!pred.matches(&make_item(&["good-pod", "Failed"]), &hdr));
+    }
+
+    #[test]
+    fn includes_and_excludes_combine() {
+        let mut pred = TableFilterPredicate::default();
+        pred.column_includes
+            .insert("NAME".to_string(), vec![Regex::new("web").unwrap()]);
+        pred.column_excludes
+            .insert("STATUS".to_string(), vec![Regex::new("Failed").unwrap()]);
+        let hdr = header(&["NAME", "STATUS"]);
+
+        // include satisfied, exclude not triggered
+        assert!(pred.matches(&make_item(&["web-server", "Running"]), &hdr));
+        // include satisfied, but exclude triggered
+        assert!(!pred.matches(&make_item(&["web-server", "Failed"]), &hdr));
+        // include NOT satisfied
+        assert!(!pred.matches(&make_item(&["api-server", "Running"]), &hdr));
+    }
+
+    #[test]
+    fn column_name_matching_is_case_insensitive() {
+        let mut pred = TableFilterPredicate::default();
+        pred.column_includes
+            .insert("status".to_string(), vec![Regex::new("Running").unwrap()]);
+        // header uses uppercase "STATUS"
+        let hdr = header(&["NAME", "STATUS"]);
+
+        assert!(pred.matches(&make_item(&["pod-a", "Running"]), &hdr));
+        assert!(!pred.matches(&make_item(&["pod-a", "Pending"]), &hdr));
+    }
+
+    #[test]
+    fn unknown_column_is_inactive_so_row_passes() {
+        let mut pred = TableFilterPredicate::default();
+        pred.column_includes.insert(
+            "NONEXISTENT".to_string(),
+            vec![Regex::new("anything").unwrap()],
+        );
+        let hdr = header(&["NAME", "STATUS"]);
+        // A constraint whose column is absent from the header is inactive (skipped),
+        // so the row is not rejected.
+        assert!(pred.matches(&make_item(&["pod-a", "Running"]), &hdr));
+    }
+
+    #[test]
+    fn matches_skips_include_when_column_absent_from_visible_columns() {
+        // version 列が表示列に無い → version の include はスキップされ行は残る
+        let visible_columns = vec!["NAME".to_string(), "STATUS".to_string()];
+        let item = make_item(&["gke-a", "Ready"]);
+
+        let mut includes = HashMap::new();
+        includes.insert("version".to_string(), vec![Regex::new("1.30").unwrap()]);
+        let pred = TableFilterPredicate {
+            column_includes: includes,
+            ..Default::default()
+        };
+
+        assert!(pred.matches(&item, &visible_columns));
+    }
+
+    #[test]
+    fn matches_skips_exclude_when_column_absent_from_visible_columns() {
+        let visible_columns = vec!["NAME".to_string(), "STATUS".to_string()];
+        let item = make_item(&["gke-a", "Ready"]);
+
+        let mut excludes = HashMap::new();
+        excludes.insert("version".to_string(), vec![Regex::new("1.30").unwrap()]);
+        let pred = TableFilterPredicate {
+            column_excludes: excludes,
+            ..Default::default()
+        };
+
+        assert!(pred.matches(&item, &visible_columns));
+    }
+
+    #[test]
+    fn matches_still_applies_present_columns() {
+        // status が表示列にある → 通常どおり効く
+        let visible_columns = vec!["NAME".to_string(), "STATUS".to_string()];
+        let ready = make_item(&["gke-a", "Ready"]);
+        let not_ready = make_item(&["gke-b", "NotReady"]);
+
+        let mut includes = HashMap::new();
+        // Use anchored pattern so "NotReady" does not match "^Ready$"
+        includes.insert("status".to_string(), vec![Regex::new("^Ready$").unwrap()]);
+        let pred = TableFilterPredicate {
+            column_includes: includes,
+            ..Default::default()
+        };
+
+        assert!(pred.matches(&ready, &visible_columns));
+        assert!(!pred.matches(&not_ready, &visible_columns));
+    }
+
+    #[test]
+    fn ansi_escape_in_cell_is_stripped_before_match() {
+        let mut pred = TableFilterPredicate::default();
+        pred.column_includes
+            .insert("STATUS".to_string(), vec![Regex::new("Running").unwrap()]);
+        let hdr = header(&["NAME", "STATUS"]);
+
+        // Cell contains ANSI green color around "Running"
+        let item = make_item(&["pod-a", "\x1b[32mRunning\x1b[0m"]);
+        assert!(pred.matches(&item, &hdr));
+    }
+
+    #[test]
+    fn ansi_escape_does_not_pollute_anchor_match() {
+        let mut pred = TableFilterPredicate::default();
+        // Anchored regex: would fail if ANSI bytes were left in the string
+        pred.column_includes
+            .insert("STATUS".to_string(), vec![Regex::new("^Ready$").unwrap()]);
+        let hdr = header(&["NAME", "STATUS"]);
+
+        // After stripping ANSI, the cell is "Ready" — anchored regex must match
+        let item = make_item(&["pod-a", "\x1b[31mReady\x1b[0m"]);
+        assert!(pred.matches(&item, &hdr));
+    }
+
+    #[test]
+    fn ansi_escape_in_cell_not_matched_as_part_of_value() {
+        let mut pred = TableFilterPredicate::default();
+        // This regex matches the literal ANSI escape sequence fragment
+        pred.column_includes
+            .insert("STATUS".to_string(), vec![Regex::new(r"\[31m").unwrap()]);
+        let hdr = header(&["NAME", "STATUS"]);
+
+        // After ANSI stripping, "[31m" is gone — regex must NOT match
+        let item = make_item(&["pod-a", "\x1b[31mReady\x1b[0m"]);
+        assert!(!pred.matches(&item, &hdr));
+    }
+
+    #[test]
+    fn is_empty_is_false_when_only_label_selector_is_set() {
+        let pred = TableFilterPredicate {
+            label_selector: Some("app=foo".to_string()),
+            ..TableFilterPredicate::default()
+        };
+        assert!(!pred.is_empty());
+    }
+
+    #[test]
+    fn is_empty_is_false_when_only_raw_is_set() {
+        let pred = TableFilterPredicate {
+            raw: "STATUS:Running".to_string(),
+            ..TableFilterPredicate::default()
+        };
+        assert!(!pred.is_empty());
+    }
+
+    #[test]
+    fn normalize_column_name_strips_space_hyphen_underscore_and_lowercases() {
+        assert_eq!(normalize_column_name("NOMINATED NODE"), "nominatednode");
+        assert_eq!(normalize_column_name("Internal-IP"), "internalip");
+        assert_eq!(normalize_column_name("Readiness_Gates"), "readinessgates");
+        assert_eq!(normalize_column_name("name"), "name");
+    }
+
+    #[test]
+    fn matches_resolves_multiword_column_via_normalized_key() {
+        let header = vec!["NAME".to_string(), "NOMINATED NODE".to_string()];
+        let item = make_item(&["pod-a", "node-x"]);
+
+        let mut includes = HashMap::new();
+        includes.insert(
+            "nominatednode".to_string(),
+            vec![Regex::new("node-x").unwrap()],
+        );
+        let pred = TableFilterPredicate {
+            column_includes: includes,
+            ..Default::default()
+        };
+
+        assert!(pred.matches(&item, &header));
+    }
+
+    #[test]
+    fn matches_resolves_hyphenated_header_from_compact_key() {
+        let header = vec!["NAME".to_string(), "INTERNAL-IP".to_string()];
+        let item = make_item(&["pod-a", "10.0.0.1"]);
+
+        let mut includes = HashMap::new();
+        includes.insert(
+            "internalip".to_string(),
+            vec![Regex::new(r"10\.0").unwrap()],
+        );
+        let pred = TableFilterPredicate {
+            column_includes: includes,
+            ..Default::default()
+        };
+
+        assert!(pred.matches(&item, &header));
+    }
+}

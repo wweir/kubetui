@@ -1,5 +1,3 @@
-use std::sync::{atomic::AtomicBool, Arc};
-
 use anyhow::Result;
 use crossbeam::channel::Sender;
 use k8s_openapi::{
@@ -7,7 +5,8 @@ use k8s_openapi::{
         core::v1::{ConfigMap, Pod, Secret, Service},
         networking::v1::{Ingress, NetworkPolicy},
     },
-    NamespaceResourceScope, Resource as _,
+    NamespaceResourceScope,
+    Resource as _,
 };
 use kube::Api;
 use serde::{de::DeserializeOwned, Serialize};
@@ -23,7 +22,7 @@ use crate::{
     },
     logger,
     message::Message,
-    workers::kube::AbortWorker,
+    workers::kube::InfiniteWorker,
 };
 
 #[derive(Debug, Clone)]
@@ -47,44 +46,39 @@ impl std::fmt::Display for GetYamlKind {
             Self::Ingress => write!(f, "{}", Ingress::URL_PATH_SEGMENT),
             Self::Service => write!(f, "{}", Service::URL_PATH_SEGMENT),
             Self::NetworkPolicy => write!(f, "{}", NetworkPolicy::URL_PATH_SEGMENT),
-            Self::Gateway(version) => match version {
-                GatewayVersion::V1 => write!(f, "{}", v1::Gateway::URL_PATH_SEGMENT),
-                GatewayVersion::V1Beta1 => write!(f, "{}", v1beta1::Gateway::URL_PATH_SEGMENT),
-            },
-            Self::HTTPRoute(version) => match version {
-                HTTPRouteVersion::V1 => write!(f, "{}", v1::HTTPRoute::URL_PATH_SEGMENT),
-                HTTPRouteVersion::V1Beta1 => write!(f, "{}", v1beta1::HTTPRoute::URL_PATH_SEGMENT),
-            },
+            Self::Gateway(version) => {
+                match version {
+                    GatewayVersion::V1 => write!(f, "{}", v1::Gateway::URL_PATH_SEGMENT),
+                    GatewayVersion::V1Beta1 => write!(f, "{}", v1beta1::Gateway::URL_PATH_SEGMENT),
+                }
+            }
+            Self::HTTPRoute(version) => {
+                match version {
+                    HTTPRouteVersion::V1 => write!(f, "{}", v1::HTTPRoute::URL_PATH_SEGMENT),
+                    HTTPRouteVersion::V1Beta1 => {
+                        write!(f, "{}", v1beta1::HTTPRoute::URL_PATH_SEGMENT)
+                    }
+                }
+            }
         }
     }
 }
 
 #[derive(Clone)]
 pub struct GetYamlWorker {
-    is_terminated: Arc<AtomicBool>,
     tx: Sender<Message>,
     client: KubeClient,
     req: GetRequest,
 }
 
 impl GetYamlWorker {
-    pub fn new(
-        is_terminated: Arc<AtomicBool>,
-        tx: Sender<Message>,
-        client: KubeClient,
-        req: GetRequest,
-    ) -> Self {
-        Self {
-            is_terminated,
-            tx,
-            client,
-            req,
-        }
+    pub fn new(tx: Sender<Message>, client: KubeClient, req: GetRequest) -> Self {
+        Self { tx, client, req }
     }
 }
 
 #[async_trait::async_trait]
-impl AbortWorker for GetYamlWorker {
+impl InfiniteWorker for GetYamlWorker {
     async fn run(&self) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
 
@@ -94,10 +88,7 @@ impl AbortWorker for GetYamlWorker {
             namespace,
         } = &self.req;
 
-        while !self
-            .is_terminated
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        loop {
             interval.tick().await;
 
             let yaml = match kind {
@@ -117,35 +108,42 @@ impl AbortWorker for GetYamlWorker {
                 GetYamlKind::NetworkPolicy => {
                     fetch_resource_yaml::<NetworkPolicy>(&self.client, name, namespace).await
                 }
-                GetYamlKind::Gateway(version) => match version {
-                    GatewayVersion::V1 => {
-                        fetch_resource_yaml::<v1::Gateway>(&self.client, name, namespace).await
+                GetYamlKind::Gateway(version) => {
+                    match version {
+                        GatewayVersion::V1 => {
+                            fetch_resource_yaml::<v1::Gateway>(&self.client, name, namespace).await
+                        }
+                        GatewayVersion::V1Beta1 => {
+                            fetch_resource_yaml::<v1beta1::Gateway>(&self.client, name, namespace)
+                                .await
+                        }
                     }
-                    GatewayVersion::V1Beta1 => {
-                        fetch_resource_yaml::<v1beta1::Gateway>(&self.client, name, namespace).await
+                }
+                GetYamlKind::HTTPRoute(version) => {
+                    match version {
+                        HTTPRouteVersion::V1 => {
+                            fetch_resource_yaml::<v1::HTTPRoute>(&self.client, name, namespace)
+                                .await
+                        }
+                        HTTPRouteVersion::V1Beta1 => {
+                            fetch_resource_yaml::<v1beta1::HTTPRoute>(&self.client, name, namespace)
+                                .await
+                        }
                     }
-                },
-                GetYamlKind::HTTPRoute(version) => match version {
-                    HTTPRouteVersion::V1 => {
-                        fetch_resource_yaml::<v1::HTTPRoute>(&self.client, name, namespace).await
-                    }
-                    HTTPRouteVersion::V1Beta1 => {
-                        fetch_resource_yaml::<v1beta1::HTTPRoute>(&self.client, name, namespace)
-                            .await
-                    }
-                },
+                }
             };
 
-            self.tx
-                .send(
-                    GetResponse {
-                        yaml,
-                        kind: kind.to_string(),
-                        name: name.to_string(),
-                    }
-                    .into(),
-                )
-                .expect("Failed to send YamlResponse::Yaml");
+            if let Err(e) = self.tx.send(
+                GetResponse {
+                    yaml,
+                    kind: kind.to_string(),
+                    name: name.to_string(),
+                }
+                .into(),
+            ) {
+                logger!(error, "Failed to send GetResponse: {}", e);
+                return;
+            }
         }
     }
 }

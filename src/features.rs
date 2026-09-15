@@ -7,5 +7,9 @@ pub mod get;
 pub mod help;
 pub mod namespace;
 pub mod network;
+pub mod node;
 pub mod pod;
+mod styled_api_resource;
 pub mod yaml;
+
+pub use styled_api_resource::StyledApiResource;

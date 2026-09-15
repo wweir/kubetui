@@ -3,8 +3,9 @@ use std::{collections::BTreeMap, fmt::Debug};
 use anyhow::{anyhow, Result};
 use futures::future::try_join_all;
 use kube::{
-    config::{KubeConfigOptions, Kubeconfig},
-    Client, Config,
+    config::{KubeConfigOptions, Kubeconfig, NamedContext},
+    Client,
+    Config,
 };
 
 use crate::kube::KubeClient;
@@ -57,64 +58,88 @@ impl std::fmt::Debug for KubeState {
 }
 
 impl KubeStore {
+    fn find_context<'a>(
+        kubeconfig: &'a Kubeconfig,
+        context_name: &str,
+    ) -> Result<&'a NamedContext> {
+        kubeconfig
+            .contexts
+            .iter()
+            .find(|ctx| ctx.name == context_name)
+            .ok_or_else(|| anyhow!(format!("Cannot find context {}", context_name)))
+    }
+
+    fn kubeconfig_options(context: &NamedContext) -> KubeConfigOptions {
+        KubeConfigOptions {
+            context: Some(context.name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    async fn build_state(config: &Kubeconfig, context: &NamedContext) -> Result<KubeState> {
+        let options = Self::kubeconfig_options(context);
+
+        let mut config = Config::from_custom_kubeconfig(config.clone(), &options).await?;
+
+        crate::kube::proxy::clear_proxy_if_no_proxy_matches(&mut config);
+        crate::kube::auth::force_non_interactive_exec(&mut config);
+
+        let target_namespace = config.default_namespace.to_string();
+
+        let client = Client::try_from(config)?;
+
+        let kube_client = KubeClient::new(client);
+
+        Ok(KubeState {
+            client: kube_client,
+            target_namespaces: vec![target_namespace],
+            target_api_resources: vec![],
+        })
+    }
+
     pub async fn try_from_kubeconfig(config: Kubeconfig) -> Result<Self> {
-        let Kubeconfig {
-            clusters,
-            contexts,
-            auth_infos,
-            ..
-        } = &config;
+        let jobs: Vec<(Context, KubeState)> = try_join_all(config.contexts.iter().map(|context| {
+            async {
+                let state = Self::build_state(&config, context).await?;
 
-        let jobs: Vec<(Context, KubeState)> = try_join_all(contexts.iter().map(|context| async {
-            let cluster = clusters.iter().find_map(|cluster| {
-                if cluster.name == context.name {
-                    Some(cluster.name.to_string())
-                } else {
-                    None
-                }
-            });
-
-            let user = auth_infos.iter().find_map(|auth_info| {
-                let Some(kube::config::Context { ref user, .. }) = context.context else {
-                    return None;
-                };
-
-                if &auth_info.name == user {
-                    Some(auth_info.name.to_string())
-                } else {
-                    None
-                }
-            });
-
-            let options = KubeConfigOptions {
-                context: Some(context.name.to_string()),
-                cluster,
-                user,
-            };
-
-            let config = Config::from_custom_kubeconfig(config.clone(), &options).await?;
-
-            let cluster_url: String = config.cluster_url.to_string();
-            let target_namespace = config.default_namespace.to_string();
-
-            let client = Client::try_from(config)?;
-
-            let kube_client = KubeClient::new(client, cluster_url);
-
-            anyhow::Ok((
-                context.name.to_string(),
-                KubeState {
-                    client: kube_client,
-                    target_namespaces: vec![target_namespace],
-                    target_api_resources: vec![],
-                },
-            ))
+                anyhow::Ok((context.name.to_string(), state))
+            }
         }))
         .await?;
 
         let inner: BTreeMap<Context, KubeState> = jobs.into_iter().collect();
 
         Ok(inner.into())
+    }
+
+    pub async fn try_from_kubeconfig_with_context(
+        config: Kubeconfig,
+        context_name: &str,
+    ) -> Result<Self> {
+        let context = Self::find_context(&config, context_name)?;
+
+        let state = Self::build_state(&config, context).await?;
+
+        let inner = BTreeMap::from([(context.name.to_string(), state)]);
+
+        Ok(inner.into())
+    }
+
+    pub async fn ensure_context(
+        &mut self,
+        kubeconfig: &Kubeconfig,
+        context_name: &str,
+    ) -> Result<()> {
+        if self.inner.contains_key(context_name) {
+            return Ok(());
+        }
+
+        let context = Self::find_context(kubeconfig, context_name)?;
+        let state = Self::build_state(kubeconfig, context).await?;
+
+        self.inner.insert(context.name.to_string(), state);
+
+        Ok(())
     }
 
     pub fn get(&self, context: &str) -> Result<&KubeState> {
@@ -144,7 +169,6 @@ mod tests {
         fn eq(&self, rhs: &Self) -> bool {
             self.target_namespaces == rhs.target_namespaces
                 && self.target_api_resources == rhs.target_api_resources
-                && self.client.as_server_url() == rhs.client.as_server_url()
         }
     }
 
@@ -195,6 +219,34 @@ mod tests {
             "#
     };
 
+    const CONFIG_CONTEXT_CLUSTER_MISMATCH: &str = indoc! {
+        r#"
+            apiVersion: v1
+            clusters:
+              - cluster:
+                  certificate-authority-data: ""
+                  server: https://192.168.0.1
+                name: cluster-1
+              - cluster:
+                  certificate-authority-data: ""
+                  server: https://192.168.0.2
+                name: dev
+            contexts:
+              - context:
+                  cluster: cluster-1
+                  namespace: ns-1
+                  user: user-1
+                name: dev
+            current-context: dev
+            kind: Config
+            preferences: {}
+            users:
+              - name: user-1
+                user:
+                  token: user-1
+            "#
+    };
+
     #[tokio::test]
     async fn kubeconfigからstateを生成() {
         let kubeconfig = Kubeconfig::from_yaml(CONFIG).unwrap();
@@ -209,7 +261,7 @@ mod tests {
             (
                 "cluster-1".to_string(),
                 KubeState {
-                    client: KubeClient::new(client.clone(), "https://192.168.0.1/"),
+                    client: KubeClient::new(client.clone()),
                     target_namespaces: vec!["ns-1".to_string()],
                     target_api_resources: Default::default(),
                 },
@@ -217,7 +269,7 @@ mod tests {
             (
                 "cluster-2".to_string(),
                 KubeState {
-                    client: KubeClient::new(client.clone(), "https://192.168.0.2/"),
+                    client: KubeClient::new(client.clone()),
                     target_namespaces: vec!["ns-2".to_string()],
                     target_api_resources: Default::default(),
                 },
@@ -225,7 +277,7 @@ mod tests {
             (
                 "cluster-3".to_string(),
                 KubeState {
-                    client: KubeClient::new(client, "https://192.168.0.3/"),
+                    client: KubeClient::new(client),
                     target_namespaces: vec!["default".to_string()],
                     target_api_resources: Default::default(),
                 },
@@ -234,5 +286,19 @@ mod tests {
         .into();
 
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn uses_context_cluster_when_names_differ() {
+        let kubeconfig = Kubeconfig::from_yaml(CONFIG_CONTEXT_CLUSTER_MISMATCH).unwrap();
+
+        let context = KubeStore::find_context(&kubeconfig, "dev").unwrap();
+        let options = KubeStore::kubeconfig_options(context);
+
+        let config = Config::from_custom_kubeconfig(kubeconfig, &options)
+            .await
+            .unwrap();
+
+        assert_eq!(config.cluster_url, "https://192.168.0.1/");
     }
 }

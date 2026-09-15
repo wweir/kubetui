@@ -8,12 +8,11 @@ use ratatui::{
     Frame,
 };
 
-use derivative::*;
-
 use super::{base::WidgetBase, Item, LiteralItem, RenderTrait, SelectedItem, WidgetTrait};
 
 use crate::{
     define_callback,
+    message::UserEvent,
     ui::{
         event::{Callback, EventResult},
         key_event_to_code,
@@ -41,7 +40,7 @@ mod inner_item {
         }
 
         #[allow(dead_code)]
-        pub fn list_item(&self) -> &Vec<ListItem> {
+        pub fn list_item(&self) -> &Vec<ListItem<'_>> {
             &self.list_item
         }
 
@@ -73,9 +72,22 @@ mod inner_item {
 define_callback!(pub OnSelectCallback, Fn(&mut Window, &LiteralItem) -> EventResult);
 define_callback!(pub RenderBlockInjection, Fn(&List, bool) -> Block<'static>);
 
+#[derive(Debug, Clone)]
+pub struct ListTheme {
+    pub selected: Style,
+}
+
+impl Default for ListTheme {
+    fn default() -> Self {
+        Self {
+            selected: Style::default().add_modifier(Modifier::REVERSED),
+        }
+    }
+}
+
 use inner_item::InnerItem;
-#[derive(Derivative)]
-#[derivative(Debug, Default)]
+
+#[derive(Debug, Default)]
 pub struct List<'a> {
     id: String,
     widget_base: WidgetBase,
@@ -83,22 +95,21 @@ pub struct List<'a> {
     state: ListState,
     chunk: Rect,
     inner_chunk: Rect,
-    #[derivative(Debug = "ignore")]
+    theme: ListTheme,
+    actions: Vec<(UserEvent, Callback)>,
     on_select: Option<OnSelectCallback>,
-    #[derivative(Debug = "ignore")]
     block_injection: Option<RenderBlockInjection>,
 }
 
-#[derive(Derivative)]
-#[derivative(Debug, Default)]
+#[derive(Debug, Default)]
 pub struct ListBuilder {
     id: String,
     widget_base: WidgetBase,
     items: Vec<LiteralItem>,
     state: ListState,
-    #[derivative(Debug = "ignore")]
+    theme: ListTheme,
+    actions: Vec<(UserEvent, Callback)>,
     on_select: Option<OnSelectCallback>,
-    #[derivative(Debug = "ignore")]
     block_injection: Option<RenderBlockInjection>,
 }
 
@@ -122,6 +133,20 @@ impl ListBuilder {
         self
     }
 
+    pub fn theme(mut self, theme: ListTheme) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    pub fn action<F, E>(mut self, ev: E, cb: F) -> Self
+    where
+        E: Into<UserEvent>,
+        F: Into<Callback>,
+    {
+        self.actions.push((ev.into(), cb.into()));
+        self
+    }
+
     pub fn on_select<F>(mut self, cb: F) -> Self
     where
         F: Into<OnSelectCallback>,
@@ -142,8 +167,10 @@ impl ListBuilder {
         let mut list = List {
             id: self.id,
             widget_base: self.widget_base,
+            theme: self.theme,
             on_select: self.on_select,
             state: self.state,
+            actions: self.actions,
             block_injection: self.block_injection,
             ..Default::default()
         };
@@ -174,8 +201,7 @@ impl<'a> List<'a> {
     fn widget(&self, block: Block<'a>) -> widgets::List<'a> {
         widgets::List::new(self.items.widget_items().to_vec())
             .block(block)
-            .style(Style::default())
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_style(self.theme.selected)
     }
 
     fn showable_height(&self) -> usize {
@@ -222,9 +248,15 @@ impl<'a> List<'a> {
             *self.state.offset_mut() = self.max_offset();
         }
     }
+
+    fn match_action(&self, ev: UserEvent) -> Option<&Callback> {
+        self.actions
+            .iter()
+            .find_map(|(cb_ev, cb)| if *cb_ev == ev { Some(cb) } else { None })
+    }
 }
 
-impl<'a> WidgetTrait for List<'a> {
+impl WidgetTrait for List<'_> {
     fn id(&self) -> &str {
         &self.id
     }
@@ -361,6 +393,7 @@ impl<'a> WidgetTrait for List<'a> {
             KeyCode::Char('G') | KeyCode::End => {
                 self.select_last();
             }
+
             KeyCode::Char('g') | KeyCode::Home => {
                 self.select_first();
             }
@@ -372,10 +405,12 @@ impl<'a> WidgetTrait for List<'a> {
 
                 return EventResult::Ignore;
             }
-            KeyCode::Char(_) => {
-                return EventResult::Ignore;
-            }
+
             _ => {
+                if let Some(cb) = self.match_action(UserEvent::Key(ev)) {
+                    return EventResult::Callback(cb.clone());
+                }
+
                 return EventResult::Ignore;
             }
         }
@@ -403,7 +438,7 @@ impl<'a> WidgetTrait for List<'a> {
     }
 }
 
-impl<'a> List<'a> {
+impl List<'_> {
     fn on_select_callback(&self) -> Option<Callback> {
         self.on_select.clone().and_then(|cb| {
             self.selected_item()

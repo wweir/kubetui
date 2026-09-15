@@ -8,43 +8,79 @@ use k8s_openapi::{
 };
 
 use crate::{
+    config::theme::WidgetThemeConfig,
     features::{
         component_id::{NETWORK_DESCRIPTION_WIDGET_ID, NETWORK_WIDGET_ID},
-        network::message::{NetworkRequest, NetworkRequestTargetParams},
+        network::{
+            message::{NetworkRequest, NetworkRequestTargetParams},
+            network_filter_applicator,
+            NetworkLabelColumn,
+        },
     },
     kube::apis::networking::gateway::v1::{Gateway, HTTPRoute},
     message::Message,
     ui::{
         event::EventResult,
-        widget::{Table, TableItem, Widget, WidgetBase, WidgetTrait as _},
-        Window, WindowAction,
+        widget::{
+            FilterForm,
+            FilterFormTheme,
+            Table,
+            TableItem,
+            TableTheme,
+            Widget,
+            WidgetBase,
+            WidgetTheme,
+            WidgetTrait as _,
+        },
+        Window,
+        WindowAction,
     },
 };
 
-pub fn network_widget(tx: &Sender<Message>) -> Widget<'static> {
+pub fn network_widget(
+    tx: &Sender<Message>,
+    label_registry: Vec<NetworkLabelColumn>,
+    theme: WidgetThemeConfig,
+) -> Widget<'static> {
     let tx = tx.clone();
+
+    let widget_theme = WidgetTheme::from(theme.clone());
+    let filter_theme = FilterFormTheme::from(theme.clone());
+    let table_theme = TableTheme::from(theme.clone());
+
+    let widget_base = WidgetBase::builder()
+        .title("Network")
+        .theme(widget_theme)
+        .build();
+
+    let filter_form = FilterForm::builder().theme(filter_theme).build();
 
     Table::builder()
         .id(NETWORK_WIDGET_ID)
-        .widget_base(WidgetBase::builder().title("Network").build())
-        .filtered_key("NAME")
+        .widget_base(widget_base)
+        .filter_form(filter_form)
+        .theme(table_theme)
+        .filter_applicator(network_filter_applicator(label_registry, tx.clone()))
+        .action('t', open_network_columns_dialog())
         .block_injection(block_injection())
         .on_select(on_select(tx))
         .build()
         .into()
 }
 
+fn open_network_columns_dialog() -> impl Fn(&mut Window) -> EventResult {
+    use crate::features::component_id::NETWORK_COLUMNS_DIALOG_ID;
+    |w: &mut Window| {
+        w.open_dialog(NETWORK_COLUMNS_DIALOG_ID);
+        EventResult::Nop
+    }
+}
+
 fn block_injection() -> impl Fn(&Table) -> WidgetBase {
     |table: &Table| {
-        let index = if let Some(index) = table.state().selected() {
-            index + 1
-        } else {
-            0
-        };
-
         let mut base = table.widget_base().clone();
 
-        *base.append_title_mut() = Some(format!(" [{}/{}]", index, table.items().len()).into());
+        *base.append_title_mut() = Some(table.count_indicator().into());
 
         base
     }

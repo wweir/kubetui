@@ -4,6 +4,7 @@ use crossbeam::channel::Sender;
 use ratatui::crossterm::event::KeyCode;
 
 use crate::{
+    config::theme::WidgetThemeConfig,
     features::{
         component_id::{POD_LOG_QUERY_HELP_DIALOG_ID, POD_LOG_QUERY_WIDGET_ID, POD_LOG_WIDGET_ID},
         pod::{
@@ -15,7 +16,14 @@ use crate::{
     message::{Message, UserEvent},
     ui::{
         event::EventResult,
-        widget::{InputFormBuilder, SelectedItem, Widget, WidgetBase, WidgetTrait as _},
+        widget::{
+            InputFormBuilder,
+            InputFormTheme,
+            SelectedItem,
+            Widget,
+            WidgetBase,
+            WidgetTrait as _,
+        },
         Window,
     },
 };
@@ -23,12 +31,21 @@ use crate::{
 pub fn log_query_widget(
     tx: &Sender<Message>,
     namespaces: Rc<RefCell<Namespace>>,
+    theme: WidgetThemeConfig,
 ) -> Widget<'static> {
     let tx = tx.clone();
 
+    let input_theme = InputFormTheme::from(theme.clone());
+
+    let widget_base = WidgetBase::builder()
+        .title("Log Query")
+        .theme(theme.into())
+        .build();
+
     InputFormBuilder::default()
         .id(POD_LOG_QUERY_WIDGET_ID)
-        .widget_base(WidgetBase::builder().title("Log Query").build())
+        .widget_base(widget_base)
+        .theme(input_theme)
         .actions(UserEvent::from(KeyCode::Enter), exec_query(tx, namespaces))
         .build()
         .into()
@@ -61,7 +78,7 @@ fn exec_query(
             LogPrefixType::PodAndContainer
         };
 
-        let config = LogConfig::new(item, namespaces.to_owned(), prefix_type);
+        let config = LogConfig::new(item, namespaces.to_owned(), prefix_type, false);
 
         tx.send(LogMessage::Request(config).into())
             .expect("Failed to send LogMessage::Request");

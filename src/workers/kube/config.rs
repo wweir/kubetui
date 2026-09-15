@@ -3,7 +3,16 @@ use std::{ops::Deref, path::PathBuf};
 use anyhow::{anyhow, Result};
 use kube::config::{Kubeconfig, KubeconfigError};
 
-use super::TargetNamespaces;
+use crate::features::{
+    api_resources::kube::ApiConfig,
+    config::ConfigColumns,
+    event::kube::EventConfig,
+    network::NetworkColumns,
+    node::kube::NodeConfig,
+    pod::kube::PodConfig,
+};
+
+use super::{ApisConfig, TargetNamespaces, YamlConfig};
 
 #[derive(Debug, Default, Clone)]
 pub struct KubeWorkerConfig {
@@ -11,6 +20,15 @@ pub struct KubeWorkerConfig {
     pub target_namespaces: Option<TargetNamespaces>,
     pub context: Option<String>,
     pub all_namespaces: bool,
+    pub fallback_namespaces: Option<Vec<String>>,
+    pub pod_config: PodConfig,
+    pub node_config: NodeConfig,
+    pub event_config: EventConfig,
+    pub api_config: ApiConfig,
+    pub apis_config: ApisConfig,
+    pub yaml_config: YamlConfig,
+    pub default_config_columns: ConfigColumns,
+    pub default_network_columns: NetworkColumns,
 }
 
 pub struct Context(String);

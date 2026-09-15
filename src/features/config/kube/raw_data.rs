@@ -1,8 +1,6 @@
 mod configmap;
 mod secret;
 
-use std::sync::{atomic::AtomicBool, Arc};
-
 use anyhow::Result;
 use async_trait::async_trait;
 use crossbeam::channel::Sender;
@@ -11,37 +9,26 @@ use crate::{
     features::config::message::{ConfigData, ConfigRequest, ConfigResponse, RequestData},
     kube::KubeClient,
     message::Message,
-    workers::kube::AbortWorker,
+    workers::kube::InfiniteWorker,
 };
 
 use self::{configmap::ConfigMapDataWorker, secret::SecretDataWorker};
 
 #[derive(Clone)]
 pub struct ConfigsDataWorker {
-    is_terminated: Arc<AtomicBool>,
     tx: Sender<Message>,
     client: KubeClient,
     req: ConfigRequest,
 }
 
 impl ConfigsDataWorker {
-    pub fn new(
-        is_terminated: Arc<AtomicBool>,
-        tx: Sender<Message>,
-        client: KubeClient,
-        req: ConfigRequest,
-    ) -> Self {
-        Self {
-            is_terminated,
-            tx,
-            client,
-            req,
-        }
+    pub fn new(tx: Sender<Message>, client: KubeClient, req: ConfigRequest) -> Self {
+        Self { tx, client, req }
     }
 }
 
 #[async_trait]
-impl AbortWorker for ConfigsDataWorker {
+impl InfiniteWorker for ConfigsDataWorker {
     async fn run(&self) {
         let ret = match &self.req {
             ConfigRequest::ConfigMap(_) => self.fetch_description::<ConfigMapDataWorker>().await,
@@ -76,10 +63,7 @@ impl ConfigsDataWorker {
 
         let worker = Worker::new(&self.client, namespace.to_string(), name.to_string());
 
-        while !self
-            .is_terminated
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        loop {
             interval.tick().await;
 
             let fetched_data = worker.fetch().await;
@@ -88,7 +72,5 @@ impl ConfigsDataWorker {
                 .send(ConfigResponse::Data(fetched_data).into())
                 .expect("Failed to send ConfigResponse::Data");
         }
-
-        Ok(())
     }
 }

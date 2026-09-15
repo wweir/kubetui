@@ -1,21 +1,21 @@
 mod action;
 mod window;
 
-use std::{
-    cell::RefCell,
-    io::{self},
-    rc::Rc,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-};
+use std::{cell::RefCell, io, rc::Rc};
 
 use anyhow::Result;
 use crossbeam::channel::{Receiver, Sender};
 use ratatui::{backend::CrosstermBackend, layout::Direction, Terminal, TerminalOptions, Viewport};
 
 use crate::{
+    cmd::ClipboardMode,
+    config::theme::ThemeConfig,
+    features::{
+        config::{ConfigColumns, ConfigLabelColumn},
+        network::{NetworkColumns, NetworkLabelColumn},
+        node::{NodeColumns, NodeLabelColumn},
+        pod::{PodColumns, PodLabelColumn},
+    },
     kube::context::{Context, Namespace},
     logger,
     message::Message,
@@ -31,42 +31,81 @@ use self::{
 pub struct Render {
     tx: Sender<Message>,
     rx: Receiver<Message>,
-    is_terminated: Arc<AtomicBool>,
+    tx_shutdown: Sender<Result<()>>,
     direction: Direction,
+    default_pod_columns: Option<PodColumns>,
+    default_node_columns: Option<NodeColumns>,
+    default_config_columns: ConfigColumns,
+    default_network_columns: NetworkColumns,
+    pod_label_columns: Vec<PodLabelColumn>,
+    node_label_columns: Vec<NodeLabelColumn>,
+    config_label_columns: Vec<ConfigLabelColumn>,
+    network_label_columns: Vec<NetworkLabelColumn>,
+    theme: ThemeConfig,
+    clipboard_mode: ClipboardMode,
+    log_max_lines: Option<usize>,
 }
 
 impl Render {
     pub fn new(
         tx: Sender<Message>,
         rx: Receiver<Message>,
-        is_terminated: Arc<AtomicBool>,
+        tx_shutdown: Sender<Result<()>>,
         direction: Direction,
+        default_pod_columns: Option<PodColumns>,
+        default_node_columns: Option<NodeColumns>,
+        default_config_columns: ConfigColumns,
+        default_network_columns: NetworkColumns,
+        pod_label_columns: Vec<PodLabelColumn>,
+        node_label_columns: Vec<NodeLabelColumn>,
+        config_label_columns: Vec<ConfigLabelColumn>,
+        network_label_columns: Vec<NetworkLabelColumn>,
+        theme: ThemeConfig,
+        clipboard_mode: ClipboardMode,
+        log_max_lines: Option<usize>,
     ) -> Self {
         Self {
             direction,
             tx,
             rx,
-            is_terminated,
+            tx_shutdown,
+            default_pod_columns,
+            default_node_columns,
+            default_config_columns,
+            default_network_columns,
+            pod_label_columns,
+            node_label_columns,
+            config_label_columns,
+            network_label_columns,
+            theme,
+            clipboard_mode,
+            log_max_lines,
         }
     }
 
-    pub fn start(self) -> Result<()> {
+    pub fn start(self) {
         logger!(info, "render start");
 
         let ret = self.render();
 
-        self.is_terminated.store(true, Ordering::Relaxed);
+        if let Err(e) = &ret {
+            logger!(error, "{}", e);
+        }
 
         logger!(info, "render end");
 
-        ret
+        self.tx_shutdown
+            .send(ret)
+            .expect("failed to send shutdown signal");
     }
 
     pub fn set_panic_hook(&self) {
-        let is_terminated = self.is_terminated.clone();
+        let tx_shutdown = self.tx_shutdown.clone();
 
         panic_set_hook!({
-            is_terminated.store(true, Ordering::Relaxed);
+            tx_shutdown
+                .send(Err(anyhow::anyhow!("panic occurred in Render worker")))
+                .expect("failed to send shutdown signal");
         });
     }
 
@@ -79,6 +118,17 @@ impl Render {
             self.tx.clone(),
             context.clone(),
             namespace.clone(),
+            self.default_pod_columns.clone(),
+            self.default_node_columns.clone(),
+            self.default_config_columns.clone(),
+            self.default_network_columns.clone(),
+            self.pod_label_columns.clone(),
+            self.node_label_columns.clone(),
+            self.config_label_columns.clone(),
+            self.network_label_columns.clone(),
+            self.theme.clone(),
+            self.clipboard_mode,
+            self.log_max_lines,
         )
         .build();
 
@@ -91,7 +141,7 @@ impl Render {
 
         terminal.clear()?;
 
-        while !self.is_terminated.load(Ordering::Relaxed) {
+        loop {
             terminal.draw(|f| {
                 window.render(f);
             })?;
@@ -99,9 +149,7 @@ impl Render {
             match window_action(&mut window, &self.rx) {
                 WindowAction::Continue => {}
                 WindowAction::CloseWindow => {
-                    self.is_terminated
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    // break
+                    break;
                 }
                 WindowAction::UpdateContents(ev) => {
                     update_contents(

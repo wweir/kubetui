@@ -11,7 +11,8 @@ use serde_yaml::Mapping;
 
 use crate::{
     features::{
-        api_resources::kube::SharedApiResources, network::message::NetworkRequestTargetParams,
+        api_resources::kube::SharedApiResources,
+        network::message::NetworkRequestTargetParams,
     },
     kube::KubeClientRequest,
 };
@@ -20,9 +21,12 @@ use self::{extract::Extract, to_value::ToValue};
 
 use super::{
     related_resources::{
-        label_selector::LabelSelectorWrapper, to_list_value::ToListValue, RelatedClient,
+        label_selector::LabelSelectorWrapper,
+        to_list_value::ToListValue,
+        RelatedClient,
     },
-    Fetch, FetchedData,
+    Fetch,
+    FetchedData,
 };
 
 pub(super) struct NetworkPolicyDescriptionWorker<'a, C>
@@ -54,21 +58,24 @@ where
     async fn fetch(&self) -> Result<FetchedData> {
         let url = format!(
             "{}/{}",
-            NetworkPolicy::url_path(&(), Some(&self.namespace)),
+            NetworkPolicy::url_path(&Default::default(), Some(&self.namespace)),
             self.name
         );
 
         let networkpolicy: NetworkPolicy = self.client.request(&url).await?;
         let networkpolicy = networkpolicy.extract();
 
-        let related_pods: Option<List<Pod>> =
-            if let Some(NetworkPolicySpec { pod_selector, .. }) = &networkpolicy.spec {
-                RelatedClient::new(self.client, &self.namespace)
-                    .related_resources::<Pod, LabelSelectorWrapper>(&pod_selector.clone().into())
-                    .await?
-            } else {
-                None
-            };
+        let related_pods: Option<List<Pod>> = if let Some(NetworkPolicySpec {
+            pod_selector: Some(pod_selector),
+            ..
+        }) = &networkpolicy.spec
+        {
+            RelatedClient::new(self.client, &self.namespace)
+                .related_resources::<Pod, LabelSelectorWrapper>(&pod_selector.clone().into())
+                .await?
+        } else {
+            None
+        };
 
         let mut related_resources = Mapping::new();
 
@@ -242,7 +249,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::{
-        features::api_resources::kube::ApiResources, kube::mock::MockTestKubeClient, mock_expect,
+        features::api_resources::kube::ApiResources,
+        kube::mock::MockTestKubeClient,
+        mock_expect,
     };
 
     use super::*;

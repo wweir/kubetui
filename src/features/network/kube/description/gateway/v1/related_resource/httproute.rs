@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
-use derivative::Derivative;
 use futures::future::{join_all, try_join_all};
 use k8s_openapi::{
-    api::core::v1::Namespace, apimachinery::pkg::apis::meta::v1::LabelSelector, Resource as _,
+    api::core::v1::Namespace,
+    apimachinery::pkg::apis::meta::v1::LabelSelector,
+    Resource as _,
 };
 use kube::{api::ListParams, Api, Client, ResourceExt as _};
 use serde::{Deserialize, Serialize};
@@ -12,8 +13,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     features::network::kube::description::utils::{label_selector_to_query, ExtractNamespace as _},
     kube::apis::networking::gateway::v1::{
-        Gateway, GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesNamespaces,
-        GatewayListenersAllowedRoutesNamespacesFrom, HTTPRoute, HTTPRouteParentRefs,
+        Gateway,
+        GatewayListenersAllowedRoutes,
+        GatewayListenersAllowedRoutesNamespaces,
+        GatewayListenersAllowedRoutesNamespacesFrom,
+        HTTPRoute,
+        HTTPRouteParentRefs,
     },
     logger,
 };
@@ -21,21 +26,36 @@ use crate::{
 pub type RelatedHTTPRoutes = Vec<RelatedHTTPRoute>;
 
 /// RelatedResourceHTTPRouteのための
-#[derive(Derivative, Debug, Clone, Serialize, Deserialize)]
-#[derivative(PartialEq, Eq, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelatedHTTPRoute {
     pub name: String,
 
     pub namespace: String,
 
-    #[derivative(PartialEq = "ignore", PartialOrd = "ignore", Ord = "ignore")]
     #[serde(skip)]
     pub resource: HTTPRoute,
+}
+
+impl Eq for RelatedHTTPRoute {}
+
+impl Ord for RelatedHTTPRoute {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // nameとnamespaceが同じであれば同じリソースとして扱う
+        self.name
+            .cmp(&other.name)
+            .then_with(|| self.namespace.cmp(&other.namespace))
+    }
 }
 
 impl PartialOrd for RelatedHTTPRoute {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RelatedHTTPRoute {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.namespace == other.namespace
     }
 }
 
@@ -219,17 +239,19 @@ async fn discover_httproute_for_selector(
 
     let namespaces = api.list(&lp).await?;
 
-    let httproutes = try_join_all(namespaces.iter().map(|ns| async {
-        let api = Api::<HTTPRoute>::namespaced(client.clone(), &ns.name_any());
+    let httproutes = try_join_all(namespaces.iter().map(|ns| {
+        async {
+            let api = Api::<HTTPRoute>::namespaced(client.clone(), &ns.name_any());
 
-        let httproutes = api.list(&ListParams::default()).await?;
+            let httproutes = api.list(&ListParams::default()).await?;
 
-        let result: Vec<_> = httproutes
-            .into_iter()
-            .filter(|httproute| check_httproute(httproute, gateway_name, gateway_namespace))
-            .collect();
+            let result: Vec<_> = httproutes
+                .into_iter()
+                .filter(|httproute| check_httproute(httproute, gateway_name, gateway_namespace))
+                .collect();
 
-        anyhow::Ok(result)
+            anyhow::Ok(result)
+        }
     }))
     .await?;
 

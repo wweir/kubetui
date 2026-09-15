@@ -15,9 +15,11 @@ impl Filter<BTreeMap<String, String>> for List<NetworkPolicy> {
             .items
             .iter()
             .filter(|item| {
-                item.spec.as_ref().map_or(false, |spec| {
-                    let wrapper: LabelSelectorWrapper = spec.pod_selector.clone().into();
-                    wrapper.expression(arg)
+                item.spec.as_ref().is_some_and(|spec| {
+                    spec.pod_selector.as_ref().is_some_and(|selector| {
+                        let wrapper: LabelSelectorWrapper = selector.clone().into();
+                        wrapper.expression(arg)
+                    })
                 })
             })
             .cloned()
@@ -42,10 +44,11 @@ impl Filter<Vec<BTreeMap<String, String>>> for List<NetworkPolicy> {
             .items
             .iter()
             .filter(|item| {
-                item.spec.as_ref().map_or(false, |spec| {
-                    let wrapper: LabelSelectorWrapper = spec.pod_selector.clone().into();
-
-                    arg.iter().any(|arg| wrapper.expression(arg))
+                item.spec.as_ref().is_some_and(|spec| {
+                    spec.pod_selector.as_ref().is_some_and(|selector| {
+                        let wrapper: LabelSelectorWrapper = selector.clone().into();
+                        arg.iter().any(|arg| wrapper.expression(arg))
+                    })
                 })
             })
             .cloned()
@@ -238,7 +241,8 @@ mod tests {
 
         use crate::{
             features::network::kube::description::related_resources::RelatedClient,
-            kube::mock::MockTestKubeClient, mock_expect,
+            kube::mock::MockTestKubeClient,
+            mock_expect,
         };
 
         #[tokio::test]

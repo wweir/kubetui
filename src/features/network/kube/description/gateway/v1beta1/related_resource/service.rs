@@ -1,5 +1,4 @@
 use anyhow::Result;
-use derivative::Derivative;
 use futures::StreamExt;
 use k8s_openapi::{api::core::v1::Service, Resource};
 use kube::{Api, Client, ResourceExt};
@@ -7,15 +6,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     features::network::kube::description::utils::ExtractNamespace as _,
-    kube::apis::networking::gateway::v1beta1::HTTPRouteRulesBackendRefs, logger,
+    kube::apis::networking::gateway::v1beta1::HTTPRouteRulesBackendRefs,
+    logger,
 };
 
 use super::httproute::RelatedHTTPRoute;
 
 pub type RelatedServices = Vec<RelatedService>;
 
-#[derive(Derivative, Debug, Clone, Serialize, Deserialize)]
-#[derivative(PartialEq, Eq, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelatedService {
     /// Service Name
     pub name: String,
@@ -26,9 +25,27 @@ pub struct RelatedService {
     /// HTTPRoute Name
     pub httproute: String,
 
-    #[derivative(PartialEq = "ignore", PartialOrd = "ignore", Ord = "ignore")]
     #[serde(skip)]
     pub resource: Service,
+}
+
+impl Eq for RelatedService {}
+
+impl Ord for RelatedService {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.name
+            .cmp(&other.name)
+            .then_with(|| self.namespace.cmp(&other.namespace))
+            .then_with(|| self.httproute.cmp(&other.httproute))
+    }
+}
+
+impl PartialEq for RelatedService {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.namespace == other.namespace
+            && self.httproute == other.httproute
+    }
 }
 
 impl PartialOrd for RelatedService {
@@ -127,12 +144,14 @@ async fn fetch_service(
     let api = Api::<Service>::namespaced(client, namespace);
 
     match api.get(&r.name).await {
-        Ok(service) => Some(RelatedService {
-            name: service.name_any(),
-            namespace: service.extract_namespace(),
-            httproute: httproute_name.to_string(),
-            resource: service,
-        }),
+        Ok(service) => {
+            Some(RelatedService {
+                name: service.name_any(),
+                namespace: service.extract_namespace(),
+                httproute: httproute_name.to_string(),
+                resource: service,
+            })
+        }
 
         Err(err) => {
             logger!(

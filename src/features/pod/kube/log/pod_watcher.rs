@@ -8,7 +8,6 @@ use std::{
     },
 };
 
-use anyhow::anyhow;
 use async_trait::async_trait;
 use crossbeam::channel::Sender;
 use futures::{StreamExt, TryStreamExt};
@@ -18,11 +17,11 @@ use regex::Regex;
 use tokio::task::AbortHandle;
 
 use crate::{
+    features::pod::message::LogMessage,
     kube::KubeClient,
     logger,
     message::Message,
-    send_response,
-    workers::kube::{AbortWorker, Worker},
+    workers::kube::{InfiniteWorker, Worker},
 };
 
 use super::{
@@ -139,7 +138,13 @@ impl Worker for PodWatcher {
                     }
                     Bookmark(_) => {}
                     Error(err) => {
-                        send_response!(self.tx, Err(anyhow!(err)));
+                        if let Err(e) = self
+                            .tx
+                            .send(LogMessage::StreamError(err.to_string()).into())
+                        {
+                            logger!(error, "Failed to send LogMessage::StreamError: {}", e);
+                            return;
+                        }
                     }
                 }
             }

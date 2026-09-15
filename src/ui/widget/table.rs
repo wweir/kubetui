@@ -1,23 +1,29 @@
 // mod filter_form;
 mod filter;
+mod filter_applicator;
+mod filter_parser;
 mod item;
 
 use std::rc::Rc;
 
-use derivative::*;
-use filter::FilterForm;
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     layout::{Constraint, Rect},
-    style::{Modifier, Style, Stylize},
+    style::{Color, Modifier, Style, Stylize},
     widgets::{
-        Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Table as TuiTable, TableState,
+        Paragraph,
+        Scrollbar,
+        ScrollbarOrientation,
+        ScrollbarState,
+        Table as TuiTable,
+        TableState,
     },
     Frame,
 };
 
 use crate::{
-    define_callback, logger,
+    define_callback,
+    logger,
     message::UserEvent,
     ui::{
         event::{Callback, EventResult},
@@ -28,8 +34,30 @@ use crate::{
 };
 
 use super::{
-    base::WidgetBase, styled_graphemes, Item, RenderTrait, SelectedItem, TableItem, WidgetTrait,
+    base::WidgetBase,
+    styled_graphemes,
+    Item,
+    RenderTrait,
+    SelectedItem,
+    TableItem,
+    WidgetTrait,
 };
+
+pub use filter::{FilterForm, FilterFormTheme};
+// `OnFilterApply`, `OnFilterCancel`, and `TableFilterParser` are part of the
+// public filter API surface; their first internal consumers (Node tab) land in
+// PR B. The `unused_imports` warning is therefore expected and silenced here.
+#[allow(unused_imports)]
+pub use filter_applicator::{
+    normalize_column_name,
+    ApplyStrategy,
+    OnFilterApply,
+    OnFilterCancel,
+    TableFilterApplicator,
+    TableFilterParser,
+    TableFilterPredicate,
+};
+pub use filter_parser::parse_table_filter;
 
 use item::InnerItem;
 
@@ -41,24 +69,39 @@ define_callback!(pub OnSelectCallback, Fn(&mut Window, &TableItem) -> EventResul
 define_callback!(pub RenderBlockInjection, Fn(&Table) -> WidgetBase);
 define_callback!(pub RenderHighlightInjection, Fn(Option<&TableItem>) -> Style);
 
-#[derive(Derivative)]
-#[derivative(Debug, Default)]
+#[derive(Debug)]
+pub struct TableTheme {
+    header_style: Style,
+}
+
+impl Default for TableTheme {
+    fn default() -> Self {
+        Self {
+            header_style: Style::default().fg(Color::DarkGray),
+        }
+    }
+}
+
+impl TableTheme {
+    pub fn header_style(mut self, style: impl Into<Style>) -> Self {
+        self.header_style = style.into();
+        self
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct TableBuilder {
     id: String,
     widget_base: WidgetBase,
-    filter_form: FilterForm,
-    show_status: bool,
+    filter_form: Option<FilterForm>,
+    filter_applicator: Option<TableFilterApplicator>,
+    theme: TableTheme,
     header: Vec<String>,
     items: Vec<TableItem>,
     state: TableState,
-    filtered_key: String,
-    #[derivative(Debug = "ignore")]
     on_select: Option<OnSelectCallback>,
-    #[derivative(Debug = "ignore")]
     actions: Vec<(UserEvent, Callback)>,
-    #[derivative(Debug = "ignore")]
     block_injection: Option<RenderBlockInjection>,
-    #[derivative(Debug = "ignore")]
     highlight_injection: Option<RenderHighlightInjection>,
 }
 
@@ -74,8 +117,23 @@ impl TableBuilder {
         self
     }
 
+    /// Enable the built-in substring filter (opened with `/`). Tables that
+    /// don't call this don't have the built-in filter, and `/` falls through
+    /// to user-defined actions registered via `.action('/', ...)`.
     pub fn filter_form(mut self, filter_form: FilterForm) -> Self {
-        self.filter_form = filter_form;
+        self.filter_form = Some(filter_form);
+        self
+    }
+
+    /// Enable rich filter parsing with the given applicator. Replaces the
+    /// default substring-only filter behavior with parser-driven filtering.
+    pub fn filter_applicator(mut self, applicator: TableFilterApplicator) -> Self {
+        self.filter_applicator = Some(applicator);
+        self
+    }
+
+    pub fn theme(mut self, theme: TableTheme) -> Self {
+        self.theme = theme;
         self
     }
 
@@ -89,11 +147,6 @@ impl TableBuilder {
 
     pub fn header(mut self, header: impl Into<Vec<String>>) -> Self {
         self.header = header.into();
-        self
-    }
-
-    pub fn filtered_key(mut self, key: impl Into<String>) -> Self {
-        self.filtered_key = key.into();
         self
     }
 
@@ -130,30 +183,26 @@ impl TableBuilder {
         self
     }
 
-    pub fn show_status(mut self) -> Self {
-        self.show_status = true;
-        self
-    }
-
     pub fn build(self) -> Table<'static> {
         let mut table = Table {
             id: self.id,
             widget_base: self.widget_base,
+            theme: self.theme,
             on_select: self.on_select,
             actions: self.actions,
             state: self.state,
-            show_status: self.show_status,
             block_injection: self.block_injection,
             highlight_injection: self.highlight_injection,
-            filtered_key: self.filtered_key.clone(),
             filter_form: self.filter_form,
+            filter_applicator: self.filter_applicator,
+            filter_state: None,
+            filter_error: None,
             ..Default::default()
         };
 
         table.items = InnerItem::builder()
             .header(self.header)
             .items(self.items)
-            .filtered_key(self.filtered_key)
             .build();
 
         table.update_row_bounds();
@@ -162,20 +211,15 @@ impl TableBuilder {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 enum Mode {
     /// 通常（検索フォーム非表示）
+    #[default]
     Normal,
     /// フィルターワード入力中（検索フォーム表示）
     FilterInput,
     /// フィルターワード確定後（検索フォーム表示）
     FilterConfirm,
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 impl Mode {
@@ -205,31 +249,27 @@ impl Mode {
     }
 }
 
-#[derive(Derivative)]
-#[derivative(Debug, Default)]
+#[derive(Debug, Default)]
 pub struct Table<'a> {
     id: String,
     widget_base: WidgetBase,
-    show_status: bool,
-    chunk_index: usize,
+    theme: TableTheme,
     items: InnerItem<'a>,
     state: TableState,
     chunk: Rect,
     row_bounds: Vec<(usize, usize)>,
-    filter_form: FilterForm,
-    filtered_key: String,
+    filter_form: Option<FilterForm>,
+    filter_applicator: Option<TableFilterApplicator>,
+    filter_state: Option<TableFilterPredicate>,
+    filter_error: Option<String>,
     mode: Mode,
-    #[derivative(Debug = "ignore")]
     on_select: Option<OnSelectCallback>,
-    #[derivative(Debug = "ignore")]
     actions: Vec<(UserEvent, Callback)>,
-    #[derivative(Debug = "ignore")]
     block_injection: Option<RenderBlockInjection>,
-    #[derivative(Debug = "ignore")]
     highlight_injection: Option<RenderHighlightInjection>,
 }
 
-impl<'a> Table<'a> {
+impl Table<'_> {
     pub fn builder() -> TableBuilder {
         TableBuilder::default()
     }
@@ -240,6 +280,65 @@ impl<'a> Table<'a> {
 
     pub fn state(&self) -> &TableState {
         &self.state
+    }
+
+    /// Title suffix showing the cursor position over the visible row count,
+    /// e.g. ` [3/12]`. While a filter is active the pre-filter total is
+    /// appended in parens: ` [3/12 (50)]`. The parens are driven by filter
+    /// state (not by `visible != total`), so a filter that happens to match
+    /// every row still signals that the list is filtered. Shared by every
+    /// list tab's `block_injection` so the indicator stays consistent.
+    pub fn count_indicator(&self) -> String {
+        let index = self.state.selected().map(|i| i + 1).unwrap_or(0);
+        let visible = self.items.len();
+        let total = self.items.original_len();
+
+        let filter_active = self
+            .filter_state
+            .as_ref()
+            .is_some_and(|predicate| !predicate.raw.is_empty());
+
+        let mut indicator = if filter_active {
+            format!(" [{}/{} ({})]", index, visible, total)
+        } else {
+            format!(" [{}/{}]", index, visible)
+        };
+
+        let inactive = self.inactive_columns();
+        if !inactive.is_empty() {
+            indicator.push_str(&format!(" (inactive: {})", inactive.join(", ")));
+        }
+
+        indicator
+    }
+
+    /// Names of filtered columns that are not currently displayed in the header
+    /// (their constraints are inactive). Sorted and de-duplicated for a stable
+    /// title. Empty when no filter is active or every filtered column is shown.
+    fn inactive_columns(&self) -> Vec<String> {
+        let Some(state) = self.filter_state.as_ref() else {
+            return Vec::new();
+        };
+        let visible_column_keys: Vec<String> = self
+            .items
+            .header()
+            .original()
+            .iter()
+            .map(|h| normalize_column_name(h))
+            .collect();
+        // Collect into a BTreeSet so the result is unique + sorted (a stable
+        // title) in one step — avoids the manual sort-then-dedup and its
+        // "dedup only removes consecutive duplicates" footgun. A column can be
+        // in both includes and excludes, so de-duplication is required.
+        state
+            .column_includes
+            .keys()
+            .chain(state.column_excludes.keys())
+            .filter(|c| !visible_column_keys.contains(c))
+            .cloned()
+            .collect::<std::collections::BTreeSet<String>>()
+            .into_iter()
+            .collect()
     }
 
     pub fn equal_header(&self, header: &[String]) -> bool {
@@ -256,11 +355,17 @@ impl<'a> Table<'a> {
         self.items = InnerItem::builder()
             .header(header)
             .items(rows)
-            .filtered_key(self.filtered_key.clone())
             .max_width(self.max_width())
             .build();
 
-        self.items.update_filter(self.filter_form.content());
+        let header = self.items.header().original().to_vec();
+        let state = self.filter_state.clone();
+        self.items.apply_filter(|item| {
+            state
+                .as_ref()
+                .map(|p| p.matches(item, &header))
+                .unwrap_or(true)
+        });
 
         self.adjust_selected(old_len, self.items.len());
 
@@ -313,7 +418,13 @@ impl<'a> Table<'a> {
             Mode::Normal => self.chunk,
 
             Mode::FilterInput | Mode::FilterConfirm => {
-                let filter_height = self.filter_form.form_height();
+                // Only reachable when filter_form is Some (the only path into
+                // FilterInput is `/` which is gated below). Map for safety.
+                let filter_height = self
+                    .filter_form
+                    .as_ref()
+                    .map(|f| f.form_height())
+                    .unwrap_or(0);
 
                 Rect::new(
                     x,
@@ -331,11 +442,17 @@ impl<'a> Table<'a> {
 
     fn filter_items(&mut self) {
         let old_len = self.items.len();
+        let header = self.items.header().original().to_vec();
+        let state = self.filter_state.clone();
 
-        self.items.update_filter(self.filter_form.content());
+        self.items.apply_filter(|item| {
+            state
+                .as_ref()
+                .map(|p| p.matches(item, &header))
+                .unwrap_or(true)
+        });
 
         self.adjust_selected(old_len, self.items.len());
-
         self.update_row_bounds();
     }
 
@@ -366,12 +483,19 @@ impl<'a> Table<'a> {
         }
     }
 
-    fn filter_cancel(&mut self) {
+    fn filter_cancel(&mut self) -> Option<Callback> {
         self.mode.normal();
 
-        self.filter_form.clear();
+        if let Some(filter_form) = self.filter_form.as_mut() {
+            filter_form.clear();
+        }
+
+        self.filter_state = None;
+        self.filter_error = None;
 
         self.filter_items();
+
+        self.on_filter_cancel_callback()
     }
 }
 
@@ -453,6 +577,7 @@ impl WidgetTrait for Table<'_> {
         let old_len = self.items.len();
 
         self.items.update_items(items.table());
+        self.filter_items();
 
         self.adjust_selected(old_len, self.items.len());
 
@@ -526,65 +651,116 @@ impl WidgetTrait for Table<'_> {
 
     fn on_key_event(&mut self, ev: KeyEvent) -> EventResult {
         match self.mode {
-            Mode::Normal | Mode::FilterConfirm => match key_event_to_code(ev) {
-                KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => {
-                    self.select_next(1);
-                }
-
-                KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => {
-                    self.select_prev(1);
-                }
-
-                KeyCode::Char('G') | KeyCode::End => {
-                    self.select_last();
-                }
-
-                KeyCode::Char('g') | KeyCode::Home => {
-                    self.select_first();
-                }
-
-                KeyCode::Char('/') => {
-                    self.mode.filter_input();
-                }
-
-                KeyCode::Char('q') | KeyCode::Esc if self.mode.is_filter_confirm() => {
-                    self.filter_cancel();
-                }
-
-                KeyCode::Enter => {
-                    if let Some(cb) = self.on_select_callback() {
-                        return EventResult::Callback(cb);
+            Mode::Normal | Mode::FilterConfirm => {
+                match key_event_to_code(ev) {
+                    KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => {
+                        self.select_next(1);
                     }
 
-                    return EventResult::Ignore;
-                }
-
-                _ => {
-                    if let Some(cb) = self.match_action(UserEvent::Key(ev)) {
-                        return EventResult::Callback(cb.clone());
+                    KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => {
+                        self.select_prev(1);
                     }
 
-                    return EventResult::Ignore;
+                    KeyCode::Char('G') | KeyCode::End => {
+                        self.select_last();
+                    }
+
+                    KeyCode::Char('g') | KeyCode::Home => {
+                        self.select_first();
+                    }
+
+                    KeyCode::Char('/') if self.filter_form.is_some() => {
+                        self.mode.filter_input();
+                    }
+
+                    KeyCode::Char('q') | KeyCode::Esc if self.mode.is_filter_confirm() => {
+                        if let Some(cb) = self.filter_cancel() {
+                            return EventResult::Callback(cb);
+                        }
+                    }
+
+                    KeyCode::Enter => {
+                        if let Some(cb) = self.on_select_callback() {
+                            return EventResult::Callback(cb);
+                        }
+
+                        return EventResult::Ignore;
+                    }
+
+                    _ => {
+                        if let Some(cb) = self.match_action(UserEvent::Key(ev)) {
+                            return EventResult::Callback(cb.clone());
+                        }
+
+                        return EventResult::Ignore;
+                    }
                 }
-            },
+            }
 
-            Mode::FilterInput => match key_event_to_code(ev) {
-                KeyCode::Enter => {
-                    self.mode.filter_confirm();
+            Mode::FilterInput => {
+                match key_event_to_code(ev) {
+                    KeyCode::Enter => {
+                        // EnterToConfirm 戦略では Enter で初めて parser を呼ぶ。
+                        // Live 戦略では既にタイプ中に state が更新されているが、parse を
+                        // 再走させてエラー状態を最終確定する。
+                        let parsed = self.run_parser_and_update_state();
+
+                        // パース失敗時は FilterInput モード継続（filter_error が立っている）
+                        if self.filter_error.is_some() {
+                            return EventResult::Nop;
+                        }
+
+                        self.mode.filter_confirm();
+
+                        // 成功時は applicator の on_apply 副作用を Window 経由で呼ぶ。
+                        if let Some(predicate) = parsed {
+                            if let Some(cb) = self.on_filter_apply_callback(predicate) {
+                                return EventResult::Callback(cb);
+                            }
+                        }
+                    }
+
+                    KeyCode::Esc => {
+                        if let Some(cb) = self.filter_cancel() {
+                            return EventResult::Callback(cb);
+                        }
+                    }
+
+                    _ => {
+                        // `?` または `help` 入力でヘルプダイアログを開く（applicator が
+                        // help_dialog_id を持つ場合のみ）。Pod log query の慣習に合わせる。
+                        // 入力欄の `?`/`help` 文字列だけクリアし、FilterInput モードは
+                        // 維持する。ヘルプは構文確認のためのコンテキストヘルプなので、
+                        // 閉じた後は空の入力欄に戻って続きを書ける方がメンタルモデルに沿う。
+                        if let Some(help_id) = self.would_be_help_command(ev) {
+                            if let Some(filter_form) = self.filter_form.as_mut() {
+                                filter_form.clear();
+                            }
+                            return EventResult::Callback(Callback::from(move |w: &mut Window| {
+                                w.open_dialog(help_id.clone());
+                                EventResult::Nop
+                            }));
+                        }
+
+                        let result = if let Some(filter_form) = self.filter_form.as_mut() {
+                            filter_form.on_key_event(ev)
+                        } else {
+                            EventResult::Ignore
+                        };
+
+                        // Live strategy: 毎キーで parse → state/error を更新
+                        if let Some(applicator) = self.filter_applicator.as_ref() {
+                            if applicator.strategy == ApplyStrategy::Live {
+                                self.run_parser_and_update_state();
+                            }
+                        }
+
+                        self.filter_items();
+
+                        return result;
+                    }
                 }
-
-                KeyCode::Esc => {
-                    self.filter_cancel();
-                }
-
-                _ => {
-                    let ev = self.filter_form.on_key_event(ev);
-
-                    self.filter_items();
-
-                    return ev;
-                }
-            },
+            }
         }
 
         EventResult::Nop
@@ -599,19 +775,16 @@ impl WidgetTrait for Table<'_> {
 
         self.update_row_bounds();
 
-        let filter_height = self.filter_form.form_height();
-
-        self.filter_form
-            .update_chunk(Rect::new(chunk.x, chunk.y, chunk.width, filter_height));
+        if let Some(filter_form) = self.filter_form.as_mut() {
+            let filter_height = filter_form.form_height();
+            filter_form.update_chunk(Rect::new(chunk.x, chunk.y, chunk.width, filter_height));
+        }
     }
 
     fn clear(&mut self) {
         self.state = TableState::default();
 
-        self.items = InnerItem::builder()
-            .max_width(self.max_width())
-            .filtered_key(self.filtered_key.clone())
-            .build();
+        self.items = InnerItem::builder().max_width(self.max_width()).build();
 
         self.row_bounds = Vec::default();
 
@@ -627,12 +800,31 @@ impl WidgetTrait for Table<'_> {
     }
 }
 
-impl<'a> Table<'a> {
+impl Table<'_> {
     fn on_select_callback(&self) -> Option<Callback> {
         self.on_select.clone().and_then(|cb| {
             self.selected_item()
                 .map(|v| Callback::new(move |w| cb(w, &v)))
         })
+    }
+
+    /// 直近 parse 成功した predicate と applicator の on_apply を捕捉して、
+    /// Window 渡しの Callback に詰めて返す。
+    fn on_filter_apply_callback(&self, predicate: TableFilterPredicate) -> Option<Callback> {
+        let on_apply = self.filter_applicator.as_ref()?.on_apply.clone()?;
+        Some(Callback::from(move |w: &mut Window| {
+            (on_apply.closure)(&predicate, w);
+            EventResult::Nop
+        }))
+    }
+
+    /// applicator の on_cancel callback を Window 渡しの Callback に詰めて返す。
+    fn on_filter_cancel_callback(&self) -> Option<Callback> {
+        let on_cancel = self.filter_applicator.as_ref()?.on_cancel.clone()?;
+        Some(Callback::from(move |w: &mut Window| {
+            (on_cancel.closure)(w);
+            EventResult::Nop
+        }))
     }
 
     fn selected_item(&self) -> Option<Rc<TableItem>> {
@@ -641,14 +833,62 @@ impl<'a> Table<'a> {
             .and_then(|index| self.items().get(index).map(|item| Rc::new(item.clone())))
     }
 
+    /// 現在の入力 + 押下キーがヘルプトリガーになるかを判定。
+    /// applicator が help_dialog_id を持ち、確定後の文字列が "?" または
+    /// "help" と完全一致する場合に Some(help_id) を返す。
+    fn would_be_help_command(&self, ev: KeyEvent) -> Option<String> {
+        let help_id = self.filter_applicator.as_ref()?.help_dialog_id.clone()?;
+        let current = self
+            .filter_form
+            .as_ref()
+            .map(|f| f.content())
+            .unwrap_or_default();
+        let typed = match key_event_to_code(ev) {
+            KeyCode::Char(c) => c,
+            _ => return None,
+        };
+        let pending = format!("{}{}", current, typed);
+        if pending == "?" || pending == "help" {
+            Some(help_id)
+        } else {
+            None
+        }
+    }
+
     fn match_action(&self, ev: UserEvent) -> Option<&Callback> {
         self.actions
             .iter()
             .find_map(|(cb_ev, cb)| if *cb_ev == ev { Some(cb) } else { None })
     }
+
+    /// 現在の filter_form 入力を parser に渡し、結果で filter_state / filter_error を
+    /// 更新する。
+    ///
+    /// 成功時は Some(predicate)、失敗時は None。
+    /// Live モードでは毎キー、EnterToConfirm モードでは Enter 時に呼ぶ。
+    fn run_parser_and_update_state(&mut self) -> Option<TableFilterPredicate> {
+        let applicator = self.filter_applicator.as_ref()?;
+        let input = self
+            .filter_form
+            .as_ref()
+            .map(|f| f.content())
+            .unwrap_or_default();
+
+        match (applicator.parser.closure)(&input) {
+            Ok(predicate) => {
+                self.filter_error = None;
+                self.filter_state = Some(predicate.clone());
+                Some(predicate)
+            }
+            Err(msg) => {
+                self.filter_error = Some(msg);
+                None
+            }
+        }
+    }
 }
 
-impl<'a> Table<'a> {
+impl Table<'_> {
     fn render_highlight_style(&self) -> Style {
         if let Some(highlight_injection) = &self.highlight_injection {
             highlight_injection(self.selected_item().as_deref())
@@ -686,6 +926,29 @@ impl RenderTrait for Table<'_> {
 
         let chunk = self.chunk();
 
+        if let Some(err) = self.filter_error.clone() {
+            let lines = vec![err];
+            let error_theme = crate::ui::widget::error::ErrorTheme::default();
+            crate::ui::widget::error::render_widget_error(
+                f,
+                chunk,
+                block.clone(),
+                &lines,
+                &error_theme,
+            );
+
+            // filter_form は引き続き描画（ユーザーが入力を直せるよう）
+            match self.mode {
+                Mode::Normal => {}
+                Mode::FilterInput | Mode::FilterConfirm => {
+                    if let Some(filter_form) = self.filter_form.as_mut() {
+                        filter_form.render(f, self.mode.is_filter_input() && is_active, false);
+                    }
+                }
+            }
+            return;
+        }
+
         if self.items.is_empty() {
             let paragraph = Paragraph::new(" No data".dark_gray()).block(block);
             f.render_widget(paragraph, chunk);
@@ -696,12 +959,17 @@ impl RenderTrait for Table<'_> {
 
             let mut widget = TuiTable::new(self.items.to_rendered_rows(), constraints)
                 .block(block)
-                .highlight_style(highlight_style)
+                .row_highlight_style(highlight_style)
                 .highlight_symbol(HIGHLIGHT_SYMBOL)
                 .column_spacing(COLUMN_SPACING);
 
             if !self.items.header().is_empty() {
-                widget = widget.header(self.items.header().rendered());
+                widget = widget.header(
+                    self.items
+                        .header()
+                        .rendered()
+                        .style(self.theme.header_style),
+                );
             }
 
             f.render_stateful_widget(widget, chunk, &mut self.state);
@@ -710,8 +978,9 @@ impl RenderTrait for Table<'_> {
         match self.mode {
             Mode::Normal => {}
             Mode::FilterInput | Mode::FilterConfirm => {
-                self.filter_form
-                    .render(f, self.mode.is_filter_input() && is_active, false);
+                if let Some(filter_form) = self.filter_form.as_mut() {
+                    filter_form.render(f, self.mode.is_filter_input() && is_active, false);
+                }
             }
         }
 
@@ -765,6 +1034,305 @@ mod tests {
                 .build();
 
             assert_eq!(item.digits(), vec![3, 3])
+        }
+    }
+
+    mod filter_form_option {
+        use super::*;
+
+        fn slash_event() -> KeyEvent {
+            KeyEvent::from(KeyCode::Char('/'))
+        }
+
+        #[test]
+        fn filter_form_未設定なら_スラッシュキーは_filter_input_に入らない() {
+            // filter_form を渡さない（None のまま）テーブル
+            let mut table = Table::builder().build();
+            assert!(matches!(table.mode, Mode::Normal));
+
+            let _ = table.on_key_event(slash_event());
+
+            // フィルタモードに入っていないこと
+            assert!(matches!(table.mode, Mode::Normal));
+        }
+
+        #[test]
+        fn filter_form_未設定で_スラッシュにユーザー_action_があれば_callback_を返す() {
+            // ユーザー定義の `/` action は filter_form がないときに発火する
+            let mut table = Table::builder()
+                .action('/', |_w: &mut Window| EventResult::Nop)
+                .build();
+
+            let result = table.on_key_event(slash_event());
+
+            assert!(matches!(result, EventResult::Callback(_)));
+            assert!(matches!(table.mode, Mode::Normal));
+        }
+
+        #[test]
+        fn filter_form_設定済みなら_スラッシュキーで_filter_input_に入る_既存挙動() {
+            // 既存挙動の回帰テスト: filter_form がある場合は `/` で FilterInput
+            let mut table = Table::builder()
+                .filter_form(FilterForm::builder().build())
+                .build();
+            assert!(matches!(table.mode, Mode::Normal));
+
+            let _ = table.on_key_event(slash_event());
+
+            assert!(matches!(table.mode, Mode::FilterInput));
+        }
+    }
+
+    mod filter_error_render {
+        use super::*;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        #[test]
+        fn filter_error_replaces_table_body() {
+            let backend = TestBackend::new(40, 6);
+            let mut terminal = Terminal::new(backend).unwrap();
+
+            let mut table = Table::builder()
+                .header(["NAME".to_string(), "STATUS".to_string()])
+                .items([TableItem::new(
+                    vec!["node-a".to_string(), "Ready".to_string()],
+                    None,
+                )])
+                .build();
+            table.filter_error = Some("invalid regex 'foo['".to_string());
+            table.update_chunk(Rect::new(0, 0, 40, 6));
+
+            terminal.draw(|f| table.render(f, true, false)).unwrap();
+
+            let buffer = terminal.backend().buffer().clone();
+            let mut dump = String::new();
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    dump.push_str(buffer[(x, y)].symbol());
+                }
+            }
+
+            assert!(
+                dump.contains("invalid regex"),
+                "error text should be rendered: {}",
+                dump
+            );
+            assert!(
+                !dump.contains("node-a"),
+                "rows should NOT be rendered when filter_error is set: {}",
+                dump
+            );
+        }
+
+        #[test]
+        fn filter_cancel_clears_filter_error_and_state() {
+            let mut table = Table::builder()
+                .header(["NAME".to_string(), "STATUS".to_string()])
+                .items([TableItem::new(
+                    vec!["node-a".to_string(), "Ready".to_string()],
+                    None,
+                )])
+                .filter_form(FilterForm::default())
+                .build();
+
+            table.filter_error = Some("invalid regex 'foo['".to_string());
+            table.filter_state = Some(TableFilterPredicate::default());
+
+            let _ = table.filter_cancel();
+
+            assert!(
+                table.filter_error.is_none(),
+                "filter_error must be cleared on cancel (so the error overlay does not linger after Esc)"
+            );
+            assert!(
+                table.filter_state.is_none(),
+                "filter_state must be cleared on cancel (so Esc fully discards any applied filter)"
+            );
+        }
+
+        #[test]
+        fn filter_cancel_returns_some_callback_when_applicator_has_on_cancel() {
+            use crate::ui::widget::{ApplyStrategy, TableFilterApplicator, TableFilterParser};
+
+            let applicator = TableFilterApplicator::new(
+                TableFilterParser::from(move |_: &str| {
+                    Ok(crate::ui::widget::TableFilterPredicate::default())
+                }),
+                ApplyStrategy::Live,
+            )
+            .with_on_cancel(crate::ui::widget::OnFilterCancel::from(
+                move |_w: &mut crate::ui::Window| {},
+            ));
+
+            let mut table = Table::builder()
+                .header(["NAME".to_string()])
+                .items([TableItem::new(vec!["a".to_string()], None)])
+                .filter_form(FilterForm::default())
+                .filter_applicator(applicator)
+                .build();
+
+            let cb = table.filter_cancel();
+            assert!(
+                cb.is_some(),
+                "filter_cancel should return on_cancel callback when applicator has one"
+            );
+            // State must still be cleared even when a callback is returned.
+            assert!(table.filter_state.is_none());
+            assert!(table.filter_error.is_none());
+        }
+
+        #[test]
+        fn filter_cancel_returns_none_when_no_applicator() {
+            let mut table = Table::builder()
+                .header(["NAME".to_string()])
+                .items([TableItem::new(vec!["a".to_string()], None)])
+                .filter_form(FilterForm::default())
+                .build();
+
+            let cb = table.filter_cancel();
+            assert!(cb.is_none(), "no applicator → filter_cancel returns None");
+        }
+    }
+
+    mod count_indicator {
+        use std::collections::HashMap;
+
+        use regex::Regex;
+
+        use super::*;
+
+        fn table_with_three() -> Table<'static> {
+            Table::builder()
+                .header(["NAME".to_string()])
+                .items([
+                    TableItem::new(vec!["aaa".to_string()], None),
+                    TableItem::new(vec!["bbb".to_string()], None),
+                    TableItem::new(vec!["aab".to_string()], None),
+                ])
+                .build()
+        }
+
+        #[test]
+        fn unfiltered_shows_selected_over_total_without_parens() {
+            let table = table_with_three();
+            // builder selects the first row when items are non-empty.
+            assert_eq!(table.count_indicator(), " [1/3]");
+        }
+
+        #[test]
+        fn no_selection_shows_zero_numerator() {
+            let mut table = table_with_three();
+            table.state = TableState::default();
+            assert_eq!(table.count_indicator(), " [0/3]");
+        }
+
+        #[test]
+        fn filtered_appends_pre_filter_total_in_parens() {
+            let mut table = table_with_three();
+
+            let mut column_includes = HashMap::new();
+            column_includes.insert("name".to_string(), vec![Regex::new("aa").unwrap()]);
+            table.filter_state = Some(TableFilterPredicate {
+                column_includes,
+                column_excludes: HashMap::new(),
+                label_selector: None,
+                raw: "aa".to_string(),
+            });
+            table.filter_items();
+
+            // aaa, aab match → 2 visible of 3 total.
+            assert_eq!(table.count_indicator(), " [1/2 (3)]");
+        }
+
+        #[test]
+        fn active_filter_matching_every_row_still_shows_total() {
+            let mut table = table_with_three();
+
+            // A predicate whose regex matches all three names. The filter is
+            // active (non-empty raw), so the total must still be shown even
+            // though visible == total.
+            let mut column_includes = HashMap::new();
+            column_includes.insert("name".to_string(), vec![Regex::new("a|b").unwrap()]);
+            table.filter_state = Some(TableFilterPredicate {
+                column_includes,
+                column_excludes: HashMap::new(),
+                label_selector: None,
+                raw: "a|b".to_string(),
+            });
+            table.filter_items();
+
+            assert_eq!(table.count_indicator(), " [1/3 (3)]");
+        }
+
+        #[test]
+        fn zero_matches_shows_zero_over_zero_with_total() {
+            let mut table = table_with_three();
+
+            let mut column_includes = HashMap::new();
+            column_includes.insert("name".to_string(), vec![Regex::new("zzz").unwrap()]);
+            table.filter_state = Some(TableFilterPredicate {
+                column_includes,
+                column_excludes: HashMap::new(),
+                label_selector: None,
+                raw: "zzz".to_string(),
+            });
+            table.filter_items();
+
+            assert_eq!(table.count_indicator(), " [0/0 (3)]");
+        }
+
+        #[test]
+        fn count_indicator_appends_inactive_badge_for_hidden_filtered_column() {
+            let mut table = Table::builder()
+                .header(["NAME".to_string(), "STATUS".to_string()])
+                .items([TableItem::new(
+                    vec!["a".to_string(), "Ready".to_string()],
+                    None,
+                )])
+                .build();
+
+            let mut includes = HashMap::new();
+            includes.insert("version".to_string(), vec![Regex::new("1.30").unwrap()]);
+            table.filter_state = Some(TableFilterPredicate {
+                column_includes: includes,
+                column_excludes: HashMap::new(),
+                label_selector: None,
+                raw: "version:1.30".to_string(),
+            });
+
+            let ind = table.count_indicator();
+            assert!(
+                ind.contains("(inactive: version)"),
+                "indicator should flag the hidden filtered column: {}",
+                ind
+            );
+        }
+
+        #[test]
+        fn count_indicator_has_no_inactive_badge_when_all_columns_visible() {
+            let mut table = Table::builder()
+                .header(["NAME".to_string(), "STATUS".to_string()])
+                .items([TableItem::new(
+                    vec!["a".to_string(), "Ready".to_string()],
+                    None,
+                )])
+                .build();
+
+            let mut includes = HashMap::new();
+            includes.insert("status".to_string(), vec![Regex::new("Ready").unwrap()]);
+            table.filter_state = Some(TableFilterPredicate {
+                column_includes: includes,
+                column_excludes: HashMap::new(),
+                label_selector: None,
+                raw: "status:Ready".to_string(),
+            });
+
+            let ind = table.count_indicator();
+            assert!(
+                !ind.contains("inactive"),
+                "no badge when all filtered columns are visible: {}",
+                ind
+            );
         }
     }
 
@@ -1116,6 +1684,82 @@ mod tests {
 
                 assert_eq!((table.state.selected(), table.state.offset()), (None, 0));
             }
+        }
+    }
+
+    mod help_dispatch {
+        use super::*;
+
+        fn dummy_applicator_with_help() -> TableFilterApplicator {
+            let parser: TableFilterParser =
+                (|_input: &str| Ok(TableFilterPredicate::default())).into();
+            TableFilterApplicator::new(parser, ApplyStrategy::EnterToConfirm)
+                .with_help_dialog("test-help-dialog")
+        }
+
+        #[test]
+        fn typing_question_mark_returns_help_callback() {
+            let mut table = Table::builder()
+                .filter_form(FilterForm::builder().build())
+                .filter_applicator(dummy_applicator_with_help())
+                .build();
+            // FilterInput モードへ
+            let _ = table.on_key_event(KeyEvent::from(KeyCode::Char('/')));
+            // `?` を打つ
+            let result = table.on_key_event(KeyEvent::from(KeyCode::Char('?')));
+
+            assert!(matches!(result, EventResult::Callback(_)));
+        }
+
+        #[test]
+        fn opening_help_keeps_filter_input_mode_with_cleared_form() {
+            let mut table = Table::builder()
+                .filter_form(FilterForm::builder().build())
+                .filter_applicator(dummy_applicator_with_help())
+                .build();
+            let _ = table.on_key_event(KeyEvent::from(KeyCode::Char('/')));
+            let _ = table.on_key_event(KeyEvent::from(KeyCode::Char('?')));
+
+            // ヘルプを開いても FilterInput を維持する（閉じた後すぐ続きを書ける）。
+            assert!(
+                table.mode.is_filter_input(),
+                "filter input mode must persist after opening help"
+            );
+            // `?` 文字は入力欄から消えている。
+            assert_eq!(
+                table.filter_form.as_ref().map(|f| f.content()),
+                Some(String::new())
+            );
+        }
+
+        #[test]
+        fn typing_normal_char_does_not_open_help() {
+            let mut table = Table::builder()
+                .filter_form(FilterForm::builder().build())
+                .filter_applicator(dummy_applicator_with_help())
+                .build();
+            let _ = table.on_key_event(KeyEvent::from(KeyCode::Char('/')));
+            let result = table.on_key_event(KeyEvent::from(KeyCode::Char('n')));
+
+            // n を打っても help_callback は返さない
+            assert!(!matches!(result, EventResult::Callback(_)));
+        }
+
+        #[test]
+        fn help_does_not_open_without_help_dialog_id() {
+            // help_dialog_id を持たない applicator
+            let parser: TableFilterParser =
+                (|_input: &str| Ok(TableFilterPredicate::default())).into();
+            let applicator = TableFilterApplicator::new(parser, ApplyStrategy::Live);
+
+            let mut table = Table::builder()
+                .filter_form(FilterForm::builder().build())
+                .filter_applicator(applicator)
+                .build();
+            let _ = table.on_key_event(KeyEvent::from(KeyCode::Char('/')));
+            let result = table.on_key_event(KeyEvent::from(KeyCode::Char('?')));
+
+            assert!(!matches!(result, EventResult::Callback(_)));
         }
     }
 }

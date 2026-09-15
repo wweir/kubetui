@@ -4,6 +4,7 @@ use ratatui::prelude::Constraint;
 
 use crate::{
     clipboard::Clipboard,
+    config::theme::WidgetThemeConfig,
     features::component_id::EVENT_TAB_ID,
     ui::{
         tab::{LayoutElement, NestedLayoutElement, NestedWidgetLayout, TabLayout},
@@ -18,8 +19,14 @@ pub struct EventTab {
 }
 
 impl EventTab {
-    pub fn new(title: &str, clipboard: &Option<Rc<RefCell<Clipboard>>>) -> Self {
-        let event_widget = event_widget(clipboard);
+    pub fn new(
+        title: &str,
+        clipboard: &Option<Rc<RefCell<Clipboard>>>,
+        theme: WidgetThemeConfig,
+    ) -> Self {
+        let error_theme = theme.error.clone().into();
+
+        let event_widget = event_widget(clipboard, theme);
 
         let layout = TabLayout::new(
             |_| {
@@ -32,7 +39,7 @@ impl EventTab {
         );
 
         EventTab {
-            tab: Tab::new(EVENT_TAB_ID, title, [event_widget], layout),
+            tab: Tab::new(EVENT_TAB_ID, title, [event_widget], layout).error_theme(error_theme),
         }
     }
 }

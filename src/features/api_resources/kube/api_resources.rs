@@ -1,12 +1,14 @@
 use std::{fmt::Display, hash::Hash, ops::Deref, sync::Arc, time};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use async_trait::async_trait;
+use crossbeam::channel::Sender;
 use futures::future::try_join_all;
 use kube::{
     discovery::{verbs, ApiGroup, Scope},
     Discovery,
 };
+use ratatui::style::{Color, Style};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tokio::{sync::RwLock, time::Instant};
@@ -19,13 +21,39 @@ use crate::{
             v1_table::{Table, TableColumnDefinition, Value},
         },
         table::insert_ns,
-        KubeClient, KubeClientRequest as _,
+        KubeClient,
+        KubeClientRequest as _,
     },
+    logger,
+    message::Message,
+    ui::widget::ansi_color::style_to_ansi,
     workers::kube::{
-        PollerBase, SharedTargetApiResources, TargetApiResources, TargetNamespaces, Worker,
-        WorkerResult,
+        InfiniteWorker,
+        SharedTargetApiResources,
+        SharedTargetNamespaces,
+        TargetApiResources,
+        TargetNamespaces,
     },
 };
+
+use super::styled_table::StyledTable;
+
+#[derive(Debug, Clone)]
+pub struct ApiConfig {
+    pub resource: Style,
+    pub header: Style,
+    pub rows: Style,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            resource: Style::default().fg(Color::DarkGray),
+            header: Style::default().fg(Color::DarkGray),
+            rows: Style::default(),
+        }
+    }
+}
 
 pub type SharedApiResources = Arc<RwLock<ApiResources>>;
 
@@ -37,10 +65,6 @@ pub struct ApiResources {
 }
 
 impl ApiResources {
-    pub fn to_vec(&self) -> Vec<ApiResource> {
-        self.inner.clone()
-    }
-
     /// SharedApiResourcesを生成
     pub fn shared() -> SharedApiResources {
         Arc::new(RwLock::new(Default::default()))
@@ -167,7 +191,7 @@ impl ApiResource {
 
     pub fn api_url_with_namespace(&self, ns: &str) -> String {
         format!(
-            "{}/namespaces/{}/{}",
+            "/{}/namespaces/{}/{}",
             self.group_version_url(),
             ns,
             self.name()
@@ -175,7 +199,7 @@ impl ApiResource {
     }
 
     pub fn api_url(&self) -> String {
-        format!("{}/{}", self.group_version_url(), self.name())
+        format!("/{}/{}", self.group_version_url(), self.name())
     }
 
     fn scope(&self) -> &Scope {
@@ -183,10 +207,6 @@ impl ApiResource {
             Self::Api { scope, .. } => scope,
             Self::Apis { scope, .. } => scope,
         }
-    }
-
-    fn to_table_header(&self) -> String {
-        format!("\x1b[90m[ {} ]\x1b[0m\n", self)
     }
 }
 
@@ -227,40 +247,44 @@ impl Display for ApiResource {
 
 #[derive(Clone)]
 pub struct ApiPoller {
-    base: PollerBase,
+    tx: Sender<Message>,
+    shared_target_namespaces: SharedTargetNamespaces,
+    kube_client: KubeClient,
     shared_target_api_resources: SharedTargetApiResources,
     shared_api_resources: SharedApiResources,
+    config: ApiConfig,
 }
 
 impl ApiPoller {
     pub fn new(
-        base: PollerBase,
+        tx: Sender<Message>,
+        shared_target_namespaces: SharedTargetNamespaces,
+        kube_client: KubeClient,
         shared_target_api_resources: SharedTargetApiResources,
         shared_api_resources: SharedApiResources,
+        config: ApiConfig,
     ) -> Self {
         Self {
-            base,
+            tx,
+            shared_target_namespaces,
+            kube_client,
             shared_target_api_resources,
             shared_api_resources,
+            config,
         }
     }
 }
 
 #[async_trait]
-impl Worker for ApiPoller {
-    type Output = WorkerResult;
-
-    async fn run(&self) -> Self::Output {
+impl InfiniteWorker for ApiPoller {
+    async fn run(&self) {
         let Self {
-            base:
-                PollerBase {
-                    is_terminated,
-                    tx,
-                    shared_target_namespaces,
-                    kube_client,
-                },
+            tx,
+            shared_target_namespaces,
+            kube_client,
             shared_target_api_resources,
             shared_api_resources,
+            config,
         } = self;
 
         match fetch_api_resources(kube_client).await {
@@ -269,8 +293,10 @@ impl Worker for ApiPoller {
                 *api_resources = fetched;
             }
             Err(err) => {
-                tx.send(ApiResponse::Poll(Err(err)).into())
-                    .expect("Failed to send ApiResponse::Poll");
+                if let Err(e) = tx.send(ApiResponse::Poll(Err(err)).into()) {
+                    logger!(error, "Failed to send ApiResponse::Poll: {}", e);
+                    return;
+                }
             }
         }
 
@@ -281,7 +307,7 @@ impl Worker for ApiPoller {
 
         let mut is_error = false;
 
-        while !is_terminated.load(std::sync::atomic::Ordering::Relaxed) {
+        loop {
             interval.tick().await;
 
             if tick_rate < last_tick.elapsed() {
@@ -292,16 +318,21 @@ impl Worker for ApiPoller {
                         let mut api_resources = shared_api_resources.write().await;
                         *api_resources = fetched;
 
-                        // Clear error
                         if is_error {
                             is_error = false;
-                            tx.send(ApiResponse::Poll(Ok(Default::default())).into())
-                                .expect("Failed to send ApiResponse::Poll");
+                            if let Err(e) =
+                                tx.send(ApiResponse::Poll(Ok(Default::default())).into())
+                            {
+                                logger!(error, "Failed to send ApiResponse::Poll: {}", e);
+                                return;
+                            }
                         }
                     }
                     Err(err) => {
-                        tx.send(ApiResponse::Poll(Err(err)).into())
-                            .expect("Failed to send ApiResponse::Poll");
+                        if let Err(e) = tx.send(ApiResponse::Poll(Err(err)).into()) {
+                            logger!(error, "Failed to send ApiResponse::Poll: {}", e);
+                            return;
+                        }
                         is_error = true;
                         continue;
                     }
@@ -319,20 +350,24 @@ impl Worker for ApiPoller {
                 kube_client,
                 &target_api_resources,
                 &target_namespaces,
+                config,
             )
             .fetch_table()
             .await;
 
-            tx.send(ApiResponse::Poll(result).into())
-                .expect("Failed to send ApiResponse::Poll");
+            if let Err(e) = tx.send(ApiResponse::Poll(result).into()) {
+                logger!(error, "Failed to send ApiResponse::Poll: {}", e);
+                return;
+            }
         }
-
-        WorkerResult::Terminated
     }
 }
 
 pub async fn fetch_api_resources(client: &KubeClient) -> Result<ApiResources> {
-    let discovery = Discovery::new(client.to_client()).run().await?;
+    let discovery = Discovery::new(client.to_client())
+        .run()
+        .await
+        .context("Failed to discover API resources")?;
 
     let ret = discovery
         .groups()
@@ -415,19 +450,19 @@ fn merge_tables(fetch_data: Vec<FetchData>, insert_ns: bool) -> Table {
 }
 
 async fn try_fetch_table(client: &KubeClient, path: &str) -> Result<Table> {
-    let table = client.table_request::<Table>(path).await;
+    let table = client.request_table::<Table>(path).await;
 
     if let Ok(t) = table {
         return Ok(t);
     }
 
-    let table = client.table_request::<NodeMetricsList>(path).await;
+    let table = client.request_table::<NodeMetricsList>(path).await;
 
     if let Ok(t) = table {
         return Ok(t.into());
     }
 
-    let table = client.table_request::<PodMetricsList>(path).await?;
+    let table = client.request_table::<PodMetricsList>(path).await?;
 
     Ok(table.into())
 }
@@ -476,6 +511,7 @@ struct FetchTargetApiResources<'a> {
     client: &'a KubeClient,
     target_api_resources: &'a TargetApiResources,
     target_namespace: &'a TargetNamespaces,
+    config: &'a ApiConfig,
 }
 
 impl<'a> FetchTargetApiResources<'a> {
@@ -483,11 +519,13 @@ impl<'a> FetchTargetApiResources<'a> {
         client: &'a KubeClient,
         target_api_resources: &'a TargetApiResources,
         target_namespace: &'a TargetNamespaces,
+        config: &'a ApiConfig,
     ) -> Self {
         Self {
             client,
             target_api_resources,
             target_namespace,
+            config,
         }
     }
 
@@ -502,9 +540,10 @@ impl<'a> FetchTargetApiResources<'a> {
             }?;
 
             let data = if table.rows.is_empty() {
-                api_resource.to_table_header()
+                table_title(api_resource, self.config.resource)
             } else {
-                api_resource.to_table_header() + &table.to_print()
+                let styled_table = StyledTable::new(&table, self.config.header, self.config.rows);
+                table_title(api_resource, self.config.resource) + &styled_table.to_string()
             };
 
             ret.extend(data.lines().map(ToString::to_string).collect::<Vec<_>>());
@@ -513,6 +552,10 @@ impl<'a> FetchTargetApiResources<'a> {
 
         Ok(ret)
     }
+}
+
+fn table_title(api_resource: &ApiResource, style: Style) -> String {
+    format!("{}[ {} ]\x1b[39m\n", style_to_ansi(style), api_resource)
 }
 
 #[cfg(test)]

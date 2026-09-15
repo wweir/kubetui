@@ -19,6 +19,13 @@
 
 *.mov
 .envrc
+/.worktrees/
+/worktree/
+
+# AI tools
+/.claude/
+/.serena/
+/.superpowers/
 
 /assets/*
 !/assets/demo*.webp

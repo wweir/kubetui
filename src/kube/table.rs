@@ -4,7 +4,8 @@ use anyhow::Result;
 
 use crate::kube::{
     apis::v1_table::{Table, TableRow},
-    KubeClient, KubeClientRequest as _,
+    KubeClient,
+    KubeClientRequest as _,
 };
 
 #[derive(Debug, Default)]
@@ -82,9 +83,9 @@ pub async fn get_resource_per_namespace<F>(
 where
     F: Fn(&TableRow, &[usize]) -> KubeTableRow,
 {
-    let table: Table = client.table_request(&path).await?;
+    let table: Table = client.request_table(&path).await?;
 
-    let indexes = table.find_indexes(target_values);
+    let indexes = table.find_indexes(target_values)?;
 
     Ok(table
         .rows

@@ -1,0 +1,304 @@
+# version: "1"
+
+# fg_color: "default" | name | hex | integer
+# bg_color: "default" | name | hex | integer
+# modifier: "none" | "bold" | "dim" | "italic" | "underlined" | "slow_blink" | "rapid_blink" | "reversed" | "hidden" | "crossed_out"
+# border.type: "plain" | "rounded" | "double" | "thick"
+
+# Namespaces to show when the Kubernetes API cannot list namespaces
+# (e.g. due to RBAC restrictions). Only used as a fallback.
+# fallback_namespaces:
+#   - production
+#   - staging
+#   - dev
+
+# Logging settings
+# logging:
+#   # Maximum number of lines retained in the log view buffer.
+#   # When the buffer exceeds this value, the oldest lines are dropped.
+#   # Can be overridden per-query with the `limit:<n>` log query keyword.
+#   max_lines: 5000
+
+theme:
+  base:
+    bg_color: "#000000"
+  tab:
+    divider:
+      char: "|"
+    base:
+      fg_color: "#c0c0c0"
+      modifier: reversed
+    active:
+      fg_color: blue
+      modifier: reversed
+    mouse_over:
+      fg_color: green
+      modifier: reversed
+  header:
+    cluster:
+      fg_color: magenta
+    namespaces:
+      fg_color: yellow
+  component:
+    base:
+      fg_color: blue
+    title:
+      active:
+        fg_color: green
+      inactive:
+        fg_color: blue
+    border:
+      type: "plain"
+      active:
+        fg_color: green
+      inactive:
+        fg_color: blue
+      mouse_over:
+        fg_color: red
+
+    ## Text component
+    text:
+      ## Search form
+      search:
+        form:
+          # base:
+          #   fg_color: yellow
+          prefix:
+            fg_color: yellow
+          query:
+            fg_color: yellow
+          suffix:
+            fg_color: yellow
+
+        ## Highlight the matched string in the search
+        highlight:
+          ## Highlight the string that is focused in the string that matches the search
+          focus:
+            fg_color: yellow
+            modifier: reversed
+
+          ## Highlight the string that matches the search
+          matches:
+            modifier: reversed
+
+      ## Highlight when selecting a range with the mouse
+      selection:
+        fg_color: green
+        modifier: reversed
+
+    ## Table component
+    table:
+      ## Filter form
+      filter:
+        # base:
+        #   fg_color: magenta
+        # border:
+        #   type: "double"
+        #   active:
+        #     fg_color: green
+        #   inactive:
+        #     fg_color: blue
+        prefix:
+          fg_color: dark_gray
+        query:
+          fg_color: yellow
+      header:
+        fg_color: lightblue
+        modifier: bold
+
+    ## Select list component
+    list:
+      ## Filter form
+      filter:
+        # base:
+        #   fg_color: magenta
+        # border:
+        #   type: "double"
+        #   active:
+        #     fg_color: green
+        #   inactive:
+        #     fg_color: blue
+        query:
+          fg_color: yellow
+
+      ## Highlight the selected item
+      selected_item:
+        fg_color: green
+        modifier: reversed
+
+      ## Item index and total count
+      status:
+        fg_color: yellow
+
+    ## Check list component
+    check_list:
+      # Style for the currently selected (focused) item
+      selected:
+        fg_color: green # Foreground color (e.g., yellow, red, blue, etc.)
+
+      # Symbol shown at the beginning of the selected item
+      selected_symbol: "→" # Examples: →, >, *, etc.
+
+      # Style for required (non-editable) items
+      required:
+        fg_color: red # Foreground color (e.g., red, gray, etc.)
+
+      # Symbol or label displayed next to required items
+      required_symbol: "✗" # Examples: "required", "✱", "[!]", etc.
+
+      # Symbol used for checked items
+      checked_symbol: "✓" # Examples: [x], ✔, *, etc.
+
+      # Symbol used for unchecked items
+      unchecked_symbol: "☐" # Examples: [ ], -, _, etc.
+
+    ## Input form
+    input:
+      fg_color: white
+
+    ## Dialog component
+    dialog:
+      ## Override the theme.base
+      # base:
+      #   bg_color: "#000000"
+
+      size:
+        ## 0.0 ~ 100.0
+        width: 85
+        ## 0.0 ~ 100.0
+        height: 85
+
+    ## Error display style (used when a widget shows an error message)
+    # error:
+    #   fg_color: red
+    #   modifier: bold
+
+  ## Pod view
+  pod:
+    ## Highlights according to the status of the pod
+    highlights:
+      - status: Running # Regex
+        fg_color: default
+      - status: (Completed|Evicted)
+        fg_color: green
+      - status: (BackOff|Err|Unknown)
+        fg_color: red
+    ## Name of the column preset to use when starting the application if no CLI flag is given
+    default_preset: minimal
+    ## Define multiple column presets which can be selected by name
+    column_presets:
+      default:
+        - name
+        - status
+        - age
+        - ip
+        - node
+      minimal:
+        - name
+        - status
+        - age
+    label_columns:
+      - name: app
+        label: app.kubernetes.io/name
+
+  ## Config view
+  config:
+    ## Register labels as columns. Each entry maps a short `name`
+    ## (used as the column header in upper case and in filter expressions)
+    ## to a label key. The cell value comes from metadata.labels[<label>];
+    ## resources without the label show an empty cell.
+    label_columns:
+      - name: instance
+        label: argocd.argoproj.io/instance
+
+  ## Network view
+  network:
+    ## Register labels as columns. Each entry maps a short `name`
+    ## (used as the column header in upper case and in filter expressions)
+    ## to a label key. The cell value comes from metadata.labels[<label>];
+    ## resources without the label show an empty cell.
+    label_columns:
+      - name: app
+        label: app.kubernetes.io/name
+
+  ## Event view
+  event:
+    highlights:
+      - type: Normal # Regex
+        summary:
+          fg_color: blue
+        message:
+          fg_color: dark_gray
+      - type: Warning
+        summary:
+          fg_color: yellow
+        message:
+          fg_color: dark_gray
+
+  ## Node view
+  node:
+    ## Name of the column preset to use at startup.
+    default_preset: default
+    ## Register node labels as columns. Each entry maps a short `name`
+    ## (used in presets, the `--node-columns` flag, and the column dialog)
+    ## to a label key. The header shown in the table is the upper-cased name.
+    ## The cell value is taken from the node's metadata.labels[<label>];
+    ## nodes without the label show an empty cell.
+    label_columns:
+      - name: zone
+        label: topology.kubernetes.io/zone
+      - name: instance
+        label: node.kubernetes.io/instance-type
+    ## Define multiple column presets which can be selected by name.
+    ## A preset is an ordered list of column names; built-in and label
+    ## columns can be mixed freely (interleaved) in any order.
+    ## Available built-in columns: name, status, roles, age, version,
+    ## internalip, externalip, osimage, kernelversion, containerruntime.
+    ## The special name `full` expands to all built-in columns.
+    column_presets:
+      default:
+        - name
+        - status
+        - roles
+        - age
+        - version
+      wide:
+        - full
+      topology:
+        - name
+        - status
+        - roles
+        - zone
+        - instance
+
+  ## API view
+  api:
+    table:
+      resource:
+        fg_color: magenta
+      header:
+        fg_color: magenta
+      rows:
+        fg_color: cyan
+    dialog:
+      preferred_version_or_latest:
+        fg_color: white
+      other_version:
+        fg_color: black
+
+  ## Yaml view
+  yaml:
+    dialog:
+      preferred_version_or_latest:
+        fg_color: yellow
+      other_version:
+        fg_color: green
+
+  ## Help dialog
+  help:
+    title:
+      fg_color: yellow
+    key:
+      fg_color: lightcyan
+    desc:
+      fg_color: gray

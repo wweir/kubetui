@@ -4,34 +4,58 @@ use crossbeam::channel::Sender;
 
 use crate::{
     clipboard::Clipboard,
+    config::theme::WidgetThemeConfig,
     features::{
         api_resources::message::ApiRequest,
-        component_id::{LIST_DIALOG_ID, LIST_WIDGET_ID},
+        component_id::{API_DIALOG_ID, API_WIDGET_ID},
     },
     message::Message,
     ui::{
         event::EventResult,
-        widget::{Text, Widget, WidgetBase, WidgetTrait as _},
+        widget::{
+            SearchForm,
+            SearchFormTheme,
+            Text,
+            TextTheme,
+            Widget,
+            WidgetBase,
+            WidgetTheme,
+            WidgetTrait as _,
+        },
         Window,
     },
 };
 
-pub fn list_widget(
+pub fn api_widget(
     tx: &Sender<Message>,
     clipboard: &Option<Rc<RefCell<Clipboard>>>,
+    theme: WidgetThemeConfig,
 ) -> Widget<'static> {
     let tx = tx.clone();
 
     let open_subwin = move |w: &mut Window| {
         tx.send(ApiRequest::Get.into())
             .expect("Failed to send ApiRequest::Get");
-        w.open_dialog(LIST_DIALOG_ID);
+        w.open_dialog(API_DIALOG_ID);
         EventResult::Nop
     };
 
+    let widget_theme = WidgetTheme::from(theme.clone());
+    let search_theme = SearchFormTheme::from(theme.clone());
+    let text_theme = TextTheme::from(theme);
+
+    let widget_base = WidgetBase::builder()
+        .title("API")
+        .theme(widget_theme)
+        .build();
+
+    let search_form = SearchForm::builder().theme(search_theme).build();
+
     let builder = Text::builder()
-        .id(LIST_WIDGET_ID)
-        .widget_base(WidgetBase::builder().title("List").build())
+        .id(API_WIDGET_ID)
+        .widget_base(widget_base)
+        .search_form(search_form)
+        .theme(text_theme)
         .block_injection(|text: &Text, is_active: bool, is_mouse_over: bool| {
             let (index, size) = text.state();
 

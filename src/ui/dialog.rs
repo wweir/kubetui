@@ -1,14 +1,89 @@
 use ratatui::{
     crossterm::event::{KeyEvent, MouseEvent},
     layout::{Margin, Rect},
-    widgets::Clear,
+    style::Style,
     Frame,
 };
 
 use super::{
     event::EventResult,
-    widget::{RenderTrait, Widget, WidgetTrait},
+    widget::{
+        render_widget_error,
+        ErrorTheme,
+        RenderTrait,
+        StyledClear,
+        Text,
+        Widget,
+        WidgetTrait,
+    },
 };
+
+#[derive(Debug, Default, Clone)]
+pub struct DialogTheme {
+    pub base_style: Style,
+
+    pub size: DialogSize,
+
+    pub error_theme: ErrorTheme,
+}
+
+impl DialogTheme {
+    pub fn base_style(mut self, style: impl Into<Style>) -> Self {
+        self.base_style = style.into();
+        self
+    }
+
+    pub fn size(mut self, size: impl Into<DialogSize>) -> Self {
+        self.size = size.into();
+        self
+    }
+
+    pub fn error_theme(mut self, theme: ErrorTheme) -> Self {
+        self.error_theme = theme;
+        self
+    }
+}
+
+pub struct DialogBuilder<'a> {
+    /// wiget to display in dialog
+    widget: Widget<'a>,
+
+    /// dialog theme
+    theme: DialogTheme,
+}
+
+impl Default for DialogBuilder<'_> {
+    fn default() -> Self {
+        Self {
+            widget: Widget::Text(Text::default()),
+            theme: DialogTheme::default(),
+        }
+    }
+}
+
+impl<'a> DialogBuilder<'a> {
+    #[must_use]
+    pub fn widget(mut self, widget: Widget<'a>) -> Self {
+        self.widget = widget;
+        self
+    }
+
+    pub fn theme(mut self, theme: DialogTheme) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    pub fn build(self) -> Dialog<'a> {
+        Dialog {
+            widget: self.widget,
+            chunk: Default::default(),
+            chunk_size: self.theme.size,
+            base_style: self.theme.base_style,
+            error_state: None,
+            error_theme: self.theme.error_theme,
+        }
+    }
+}
 
 /// Dialogの大きさを決めるための構造体
 ///
@@ -29,12 +104,12 @@ use super::{
 /// │                        │ bottom                 │
 /// │                        ▼                        │
 /// └─────────────────────────────────────────────────┘
-#[derive(Debug)]
-struct DialogSize {
+#[derive(Debug, Clone, Copy)]
+pub struct DialogSize {
     /// content width percentage (0.0 ~ 100.0)
-    width: f32,
+    pub width: f32,
     /// content height percentage (0.0 ~ 100.0)
-    height: f32,
+    pub height: f32,
 }
 
 impl Default for DialogSize {
@@ -64,15 +139,26 @@ pub struct Dialog<'a> {
     widget: Widget<'a>,
     chunk: Rect,
     chunk_size: DialogSize,
+    base_style: Style,
+    error_state: Option<Vec<String>>,
+    error_theme: ErrorTheme,
 }
 
 impl<'a> Dialog<'a> {
+    #[allow(dead_code)]
     pub fn new(widget: Widget<'a>) -> Self {
         Self {
             widget,
             chunk: Default::default(),
             chunk_size: Default::default(),
+            base_style: Style::default(),
+            error_state: None,
+            error_theme: ErrorTheme::default(),
         }
+    }
+
+    pub fn builder() -> DialogBuilder<'a> {
+        DialogBuilder::default()
     }
 
     pub fn chunk(&self) -> Rect {
@@ -102,10 +188,31 @@ impl<'a> Dialog<'a> {
         &mut self.widget
     }
 
-    pub fn render(&mut self, f: &mut Frame) {
-        f.render_widget(Clear, self.chunk);
+    /// ダイアログ内ウィジェットのエラー状態を設定する。
+    pub fn set_widget_error(&mut self, lines: Vec<String>) {
+        self.error_state = Some(lines);
+    }
 
-        self.widget.render(f, true, false)
+    /// ダイアログ内ウィジェットのエラー状態をクリアする。
+    pub fn clear_widget_error(&mut self) {
+        self.error_state = None;
+    }
+
+    pub fn render(&mut self, f: &mut Frame) {
+        f.render_widget(StyledClear::new(self.base_style), self.chunk);
+
+        if let Some(error_lines) = &self.error_state {
+            let block = self.widget.widget_base().render_block(true, false);
+            render_widget_error(
+                f,
+                self.widget.chunk(),
+                block,
+                error_lines,
+                &self.error_theme,
+            );
+        } else {
+            self.widget.render(f, true, false)
+        }
     }
 
     pub fn on_key_event(&mut self, ev: KeyEvent) -> EventResult {

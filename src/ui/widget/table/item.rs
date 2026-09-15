@@ -1,16 +1,11 @@
-use derivative::*;
-use ratatui::{
-    style::{Color, Style},
-    widgets::{Cell, Row},
-};
+use ratatui::widgets::{Cell, Row};
 use std::ops::Deref;
 
-use crate::{
-    logger,
-    ui::widget::{
-        line::convert_lines_to_styled_lines, styled_graphemes::StyledGraphemes, wrap::wrap_line,
-        TableItem,
-    },
+use crate::ui::widget::{
+    line::convert_lines_to_styled_lines,
+    styled_graphemes::StyledGraphemes,
+    wrap::wrap_line,
+    TableItem,
 };
 
 use super::COLUMN_SPACING;
@@ -23,7 +18,6 @@ pub struct InnerItemBuilder {
     header: Vec<String>,
     items: Vec<TableItem>,
     max_width: usize,
-    filtered_key: String,
 }
 
 impl InnerItemBuilder {
@@ -42,17 +36,11 @@ impl InnerItemBuilder {
         self
     }
 
-    pub fn filtered_key(mut self, key: impl Into<String>) -> Self {
-        self.filtered_key = key.into();
-        self
-    }
-
     pub fn build(self) -> InnerItem<'static> {
         let mut inner_item = InnerItem {
             header: Header::new(self.header),
             original_items: self.items.clone(),
             filtered_items: self.items,
-            filtered_key: self.filtered_key,
             ..Default::default()
         };
 
@@ -68,8 +56,7 @@ pub struct InnerRow<'a> {
     pub height: usize,
 }
 
-#[derive(Derivative)]
-#[derivative(Debug, Default)]
+#[derive(Debug, Default)]
 pub struct InnerItem<'a> {
     header: Header<'a>,
     original_items: Vec<TableItem>,
@@ -78,11 +65,9 @@ pub struct InnerItem<'a> {
     item_margin: u16,
     digits: Digits,
     max_width: usize,
-    filtered_key: String,
-    filtered_word: String,
 }
 
-impl<'a> InnerItem<'a> {
+impl InnerItem<'_> {
     pub fn builder() -> InnerItemBuilder {
         InnerItemBuilder::default()
     }
@@ -91,11 +76,17 @@ impl<'a> InnerItem<'a> {
         self.filtered_items.len()
     }
 
+    /// Number of items before any filter is applied. `len()` returns the
+    /// post-filter (visible) count; this returns the pre-filter total.
+    pub fn original_len(&self) -> usize {
+        self.original_items.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.filtered_items.is_empty()
     }
 
-    pub fn header(&self) -> &Header {
+    pub fn header(&self) -> &Header<'_> {
         &self.header
     }
 
@@ -103,11 +94,11 @@ impl<'a> InnerItem<'a> {
         &self.filtered_items
     }
 
-    pub fn rendered_items(&self) -> &[InnerRow] {
+    pub fn rendered_items(&self) -> &[InnerRow<'_>] {
         &self.rendered_items
     }
 
-    pub fn to_rendered_rows(&self) -> Vec<Row> {
+    pub fn to_rendered_rows(&self) -> Vec<Row<'_>> {
         self.rendered_items.iter().cloned().map(|i| i.row).collect()
     }
 
@@ -121,7 +112,7 @@ impl<'a> InnerItem<'a> {
 
     pub fn update_items(&mut self, item: Vec<TableItem>) {
         self.original_items = item;
-        self.inner_filter_items();
+        self.filtered_items = self.original_items.clone();
         self.inner_update_rendered_items();
     }
 
@@ -130,39 +121,23 @@ impl<'a> InnerItem<'a> {
         self.inner_update_rendered_items();
     }
 
-    pub fn update_filter(&mut self, word: impl Into<String>) {
-        self.filtered_word = word.into();
-        self.inner_filter_items();
+    /// 外部から渡された predicate で original_items を filtered_items に
+    /// 絞り込む。filter_state ベースの新パスで使う。
+    pub fn apply_filter<F>(&mut self, mut predicate: F)
+    where
+        F: FnMut(&TableItem) -> bool,
+    {
+        self.filtered_items = self
+            .original_items
+            .iter()
+            .filter(|i| predicate(i))
+            .cloned()
+            .collect();
         self.inner_update_rendered_items();
     }
 }
 
-impl<'a> InnerItem<'a> {
-    fn inner_filter_items(&mut self) {
-        self.filtered_items = if self.filtered_word.is_empty() {
-            self.original_items.clone()
-        } else {
-            self.original_items
-                .iter()
-                .filter_map(|item| {
-                    let choice = item.item[self.filtered_index()]
-                        .styled_graphemes_symbols()
-                        .concat();
-
-                    if self
-                        .filtered_word
-                        .split(' ')
-                        .any(|pattern| choice.contains(pattern))
-                    {
-                        Some(item.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        }
-    }
-
+impl InnerItem<'_> {
     fn inner_update_rendered_items(&mut self) {
         self.digits = Digits::new(&self.filtered_items, &self.header.original, self.max_width);
 
@@ -209,9 +184,11 @@ impl<'a> InnerItem<'a> {
                 .rendered_items
                 .iter()
                 .cloned()
-                .map(|r| InnerRow {
-                    row: r.row.bottom_margin(ITEM_BOTTOM_MARGIN),
-                    ..r
+                .map(|r| {
+                    InnerRow {
+                        row: r.row.bottom_margin(ITEM_BOTTOM_MARGIN),
+                        ..r
+                    }
                 })
                 .collect();
 
@@ -219,24 +196,6 @@ impl<'a> InnerItem<'a> {
         } else {
             self.item_margin = 0;
         }
-    }
-
-    fn filtered_index(&self) -> usize {
-        let index = self
-            .header
-            .original
-            .iter()
-            .position(|header| header == &self.filtered_key)
-            .unwrap_or(0);
-
-        logger!(
-            debug,
-            "[table] header={:?} filtered_key={}",
-            self.header.original,
-            index
-        );
-
-        index
     }
 }
 
@@ -248,10 +207,12 @@ pub struct Header<'a> {
 
 impl Header<'_> {
     fn new(header: Vec<String>) -> Self {
-        let rendered = Row::new(header.iter().cloned().map(|h| {
-            Cell::from(h.styled_graphemes_symbols().concat())
-                .style(Style::default().fg(Color::DarkGray))
-        }))
+        let rendered = Row::new(
+            header
+                .iter()
+                .cloned()
+                .map(|h| Cell::from(h.styled_graphemes_symbols().concat())),
+        )
         .bottom_margin(HEADER_BOTTOM_MARGIN);
 
         Self {
@@ -264,7 +225,7 @@ impl Header<'_> {
         &self.original
     }
 
-    pub fn rendered(&self) -> Row {
+    pub fn rendered(&self) -> Row<'_> {
         self.rendered.clone()
     }
 
@@ -305,32 +266,36 @@ impl Digits {
             }
         }
 
-        let sum_width = digits.iter().sum::<usize>()
-            + (COLUMN_SPACING as usize * digits.len().saturating_sub(1));
+        // Width available for cell content, i.e. excluding the spacing drawn
+        // between columns.
+        let spacing = COLUMN_SPACING as usize * digits.len().saturating_sub(1);
+        let content_budget = max_width.saturating_sub(spacing);
 
-        if max_width < sum_width {
-            let index_of_longest_digits = digits
+        // Shrink the column that is currently the widest by one each step,
+        // until the total fits the budget. The widest column changes as we
+        // shrink, so once two columns are tied at the top they shrink together
+        // (water-fill / leveling). This truncates long values (typically NAME)
+        // first while keeping the column readable as long as possible, and
+        // only starts trimming shorter columns once the long one has caught
+        // down to their level. No column is reduced below MIN_COLUMN_WIDTH
+        // (it would vanish), and the total always fits the budget (so ratatui
+        // does not clip a whole column off the right edge).
+        const MIN_COLUMN_WIDTH: usize = 1;
+
+        while digits.iter().sum::<usize>() > content_budget {
+            let Some(idx) = digits
                 .iter()
                 .enumerate()
-                .max_by_key(|(_, l)| *l)
-                .unwrap_or((0, &0))
-                .0;
+                .filter(|(_, &w)| w > MIN_COLUMN_WIDTH)
+                .max_by_key(|(_, &w)| w)
+                .map(|(i, _)| i)
+            else {
+                // Every column is already at the minimum width; the pane is
+                // too narrow to fit them all and nothing more can be shrunk.
+                break;
+            };
 
-            let sum_width: usize = digits
-                .iter()
-                .enumerate()
-                .filter_map(|(i, w)| {
-                    if i == index_of_longest_digits {
-                        None
-                    } else {
-                        Some(w)
-                    }
-                })
-                .sum();
-
-            digits[index_of_longest_digits] = max_width.saturating_sub(
-                (COLUMN_SPACING as usize * digits.len().saturating_sub(1)) + sum_width,
-            );
+            digits[idx] -= 1;
         }
 
         Self(digits)
@@ -349,42 +314,74 @@ impl Deref for Digits {
 mod tests {
     use super::*;
 
-    mod filtered_index {
+    mod digits {
         use super::*;
         use pretty_assertions::assert_eq;
 
-        #[test]
-        fn headerにfiltered_keyに一致する要素があるとき要素のインデックスを返す() {
-            let item = InnerItem::builder()
-                .header(
-                    ["FOO", "BAR", "BAZ"]
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>(),
-                )
-                .filtered_key("BAR")
-                .build();
+        fn items(cells: &[&str]) -> Vec<TableItem> {
+            vec![TableItem::new(
+                cells.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                None,
+            )]
+        }
 
-            let actual = item.filtered_index();
+        fn header(cols: &[&str]) -> Vec<String> {
+            cols.iter().map(ToString::to_string).collect()
+        }
 
-            assert_eq!(actual, 1);
+        fn total(digits: &Digits) -> usize {
+            digits.iter().sum::<usize>() + COLUMN_SPACING as usize * digits.len().saturating_sub(1)
         }
 
         #[test]
-        fn headerにfiltered_keyに一致する要素がないとき0を返す() {
-            let item = InnerItem::builder()
-                .header(
-                    ["FOO", "BAR", "BAZ"]
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>(),
-                )
-                .filtered_key("HOGE")
-                .build();
+        fn 十分な幅では自然幅をそのまま使う() {
+            let h = header(&["NAME", "ZONE", "STATUS"]);
+            let it = items(&["node-abcdefgh", "", "Ready"]);
 
-            let actual = item.filtered_index();
+            let digits = Digits::new(&it, &h, usize::MAX);
 
-            assert_eq!(actual, 0);
+            // NAME=13, ZONE=ヘッダ4, STATUS=ヘッダ6
+            assert_eq!(*digits, vec![13, 4, 6]);
+        }
+
+        #[test]
+        fn 狭い幅でもどの列も0に潰れずクリップされない() {
+            let h = header(&["NAME", "ZONE", "STATUS"]);
+            let it = items(&["gke-very-long-node-name-0123456789", "", "Ready"]);
+
+            let digits = Digits::new(&it, &h, 16);
+
+            assert!(
+                digits.iter().all(|&w| w >= 1),
+                "どの列も0幅にならないこと: {:?}",
+                *digits
+            );
+            assert!(
+                total(&digits) <= 16,
+                "合計が max_width に収まること: total={} digits={:?}",
+                total(&digits),
+                *digits
+            );
+        }
+
+        #[test]
+        fn 縮小は常に現在の最長列から行い最小列は他列が並ぶまで保たれる() {
+            let h = header(&["NAME", "ZONE", "STATUS"]);
+            let it = items(&["gke-very-long-node-name-0123456789", "", "Ready"]);
+
+            let digits = Digits::new(&it, &h, 20);
+
+            // 最長の NAME 列が縮められ、自然幅(34)より小さくなる。
+            assert!(digits[0] < 34, "NAME は縮小される: {:?}", *digits);
+            // ZONE(=4) は最も短いので、他列が ZONE と同等以下に下がるまで保たれる。
+            assert_eq!(
+                digits[1], 4,
+                "ZONE は他列が ZONE と並ぶまで保たれる: {:?}",
+                *digits
+            );
+            // STATUS は ZONE 以上の幅を保つ（他列が ZONE 以下になっていない）。
+            assert!(digits[2] >= digits[1], "STATUS >= ZONE: {:?}", *digits);
+            assert!(total(&digits) <= 20);
         }
     }
 }

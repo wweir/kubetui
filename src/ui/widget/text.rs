@@ -5,19 +5,17 @@ mod wrap;
 
 use std::{cell::RefCell, rc::Rc};
 
-use derivative::Derivative;
-
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     layout::Rect,
     widgets::{Block, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
-use search::SearchForm;
 
 use crate::{
     clipboard::Clipboard,
-    define_callback, logger,
+    define_callback,
+    logger,
     message::UserEvent,
     ui::{
         event::{Callback, EventResult},
@@ -27,15 +25,24 @@ use crate::{
 };
 
 use super::{
-    styled_graphemes::StyledGrapheme, Item, LiteralItem, RenderTrait, SelectedItem, WidgetBase,
+    styled_graphemes::StyledGrapheme,
+    Item,
+    LiteralItem,
+    RenderTrait,
+    SelectedItem,
+    WidgetBase,
     WidgetTrait,
 };
 
 use self::{
-    highlight_content::{HighlightArea, HighlightContent, Point},
+    highlight_content::{HighlightArea, Point},
     item::TextItem,
     render::{Render, Scroll},
 };
+
+pub use item::{SearchHighlightFocusStyle, SearchHighlightMatchesStyle, SearchHighlightStyle};
+pub use render::SelectionStyle;
+pub use search::{SearchForm, SearchFormTheme};
 
 define_callback!(pub RenderBlockInjection, Fn(&Text, bool, bool) -> Block<'static> );
 
@@ -103,20 +110,12 @@ mod highlight_content {
             }
         }
     }
-
-    #[derive(Default, Debug, Clone)]
-    pub struct HighlightContent {
-        /// 範囲選択されている座標
-        pub area: HighlightArea,
-
-        /// D&Dの間followをとめるためにTextItemに設定されているfollowを保存する
-        pub follow: bool,
-    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 enum Mode {
     /// 通常 （検索フォーム非表示）
+    #[default]
     Normal,
     /// 検索ワード入力中（検索フォーム表示）
     SearchInput,
@@ -124,10 +123,29 @@ enum Mode {
     SearchConfirm,
 }
 
-impl Default for Mode {
-    fn default() -> Self {
-        Self::Normal
-    }
+#[derive(Debug, Default, Clone, Copy)]
+enum AutoScrollDirection {
+    #[default]
+    None,
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Default)]
+enum InteractionState {
+    /// アイドル状態
+    #[default]
+    Idle,
+    /// マウスで範囲選択中
+    Selecting {
+        area: HighlightArea,
+        /// 自動スクロールの方向（縦、横）
+        auto_scroll: (AutoScrollDirection, AutoScrollDirection),
+        /// 最後のマウス位置（相対座標）
+        last_mouse_pos: Point,
+    },
 }
 
 impl Mode {
@@ -156,8 +174,16 @@ impl Mode {
     }
 }
 
-#[derive(Derivative)]
-#[derivative(Debug, Default)]
+#[derive(Debug, Clone, Default)]
+pub struct TextTheme {
+    /// 検索にマッチした文字列のスタイル
+    pub search: SearchHighlightStyle,
+
+    /// マウスで範囲選択中のスタイル
+    pub selection: SelectionStyle,
+}
+
+#[derive(Debug, Default)]
 pub struct TextBuilder {
     id: String,
     widget_base: WidgetBase,
@@ -165,12 +191,11 @@ pub struct TextBuilder {
     item: Vec<LiteralItem>,
     wrap: bool,
     follow: bool,
-    #[derivative(Debug = "ignore")]
+    theme: TextTheme,
     block_injection: Option<RenderBlockInjection>,
-    #[derivative(Debug = "ignore")]
     actions: Vec<(UserEvent, Callback)>,
-    #[derivative(Debug = "ignore")]
     clipboard: Option<Rc<RefCell<Clipboard>>>,
+    max_lines: Option<usize>,
 }
 
 impl TextBuilder {
@@ -184,7 +209,6 @@ impl TextBuilder {
         self
     }
 
-    #[allow(dead_code)]
     pub fn search_form(mut self, search_form: SearchForm) -> Self {
         self.search_form = search_form;
         self
@@ -206,6 +230,11 @@ impl TextBuilder {
 
     pub fn follow(mut self) -> Self {
         self.follow = true;
+        self
+    }
+
+    pub fn theme(mut self, theme: TextTheme) -> Self {
+        self.theme = theme;
         self
     }
 
@@ -231,24 +260,32 @@ impl TextBuilder {
         self
     }
 
+    pub fn max_lines(mut self, max_lines: Option<usize>) -> Self {
+        self.max_lines = max_lines;
+        self
+    }
+
     pub fn build(self) -> Text {
+        let mut item = TextItem::new(self.item, None, self.theme.search.clone());
+        item.set_max_lines(self.max_lines);
         Text {
             id: self.id,
             widget_base: self.widget_base,
             search_form: self.search_form,
-            item: TextItem::new(self.item, None),
+            item,
             wrap: self.wrap,
             follow: self.follow,
+            theme: self.theme,
             actions: self.actions,
             block_injection: self.block_injection,
             clipboard: self.clipboard,
+            default_max_lines: self.max_lines,
             ..Default::default()
         }
     }
 }
 
-#[derive(Derivative)]
-#[derivative(Debug, Default)]
+#[derive(Debug, Default)]
 pub struct Text {
     id: String,
     widget_base: WidgetBase,
@@ -260,18 +297,37 @@ pub struct Text {
     search_form: SearchForm,
     /// 検索中、検索ワード入力中、オフの3つのモード
     mode: Mode,
-    highlight_content: Option<HighlightContent>,
-    #[derivative(Debug = "ignore")]
+    interaction_state: InteractionState,
+    theme: TextTheme,
     block_injection: Option<RenderBlockInjection>,
-    #[derivative(Debug = "ignore")]
     actions: Vec<(UserEvent, Callback)>,
-    #[derivative(Debug = "ignore")]
     clipboard: Option<Rc<RefCell<Clipboard>>>,
+    /// マウスドラッグ中に受け取ったアイテムを一時的に保持するバッファ
+    pending_items: Vec<Item>,
+    /// 設定ファイルから読み込んだデフォルトのmax_lines（clear時に復元する）
+    default_max_lines: Option<usize>,
 }
 
 impl Text {
     pub fn builder() -> TextBuilder {
         Default::default()
+    }
+
+    /// followが有効で、かつユーザーがインタラクション中でない場合にtrueを返す
+    fn should_follow(&self) -> bool {
+        self.follow && matches!(self.interaction_state, InteractionState::Idle)
+    }
+
+    pub fn set_max_lines(&mut self, max_lines: Option<usize>) {
+        self.item.set_max_lines(max_lines);
+    }
+
+    /// ドラッグ中にバッファリングされたアイテムを反映する
+    fn flush_pending_items(&mut self) {
+        let items = std::mem::take(&mut self.pending_items);
+        for item in items {
+            self.append_widget_item(item);
+        }
     }
 }
 
@@ -419,6 +475,54 @@ impl Text {
             .saturating_sub(self.inner_chunk().height as usize)
     }
 
+    /// Tick イベント時に呼ばれ、ドラッグ中の自動スクロールを実行する
+    pub fn on_tick(&mut self) {
+        // auto_scrollとlast_mouse_posの値をコピーして借用チェッカーのエラーを回避
+        let (auto_scroll, last_mouse_pos) = if let InteractionState::Selecting {
+            auto_scroll,
+            last_mouse_pos,
+            ..
+        } = &self.interaction_state
+        {
+            (*auto_scroll, *last_mouse_pos)
+        } else {
+            return;
+        };
+
+        // 縦方向の自動スクロール
+        match auto_scroll.0 {
+            AutoScrollDirection::Up => {
+                self.select_prev(1);
+            }
+            AutoScrollDirection::Down => {
+                self.select_next(1);
+            }
+            _ => {}
+        }
+
+        // 横方向の自動スクロール
+        if !self.wrap {
+            match auto_scroll.1 {
+                AutoScrollDirection::Left => {
+                    self.scroll_left(1);
+                }
+                AutoScrollDirection::Right => {
+                    self.scroll_right(1);
+                }
+                _ => {}
+            }
+        }
+
+        // スクロール後の座標で選択範囲を更新
+        if let InteractionState::Selecting { area, .. } = &mut self.interaction_state {
+            let (x, y) = (
+                last_mouse_pos.x + self.scroll.x,
+                last_mouse_pos.y + self.scroll.y,
+            );
+            *area = area.end(x, y);
+        }
+    }
+
     pub fn chunk(&self) -> Rect {
         let Rect {
             x,
@@ -522,6 +626,12 @@ impl WidgetTrait for Text {
     }
 
     fn append_widget_item(&mut self, item: Item) {
+        // マウスドラッグ中はコンテンツの追加をバッファリングする
+        if matches!(self.interaction_state, InteractionState::Selecting { .. }) {
+            self.pending_items.push(item);
+            return;
+        }
+
         let is_bottom = self.is_bottom();
 
         match item {
@@ -532,7 +642,13 @@ impl WidgetTrait for Text {
             }
         }
 
-        if self.follow && is_bottom {
+        // トリムされた行数分スクロール位置を調整
+        let trimmed = self.item.take_trimmed_wrapped_count();
+        if trimmed > 0 {
+            self.scroll.y = self.scroll.y.saturating_sub(trimmed);
+        }
+
+        if self.should_follow() && is_bottom {
             self.select_last()
         }
     }
@@ -543,7 +659,7 @@ impl WidgetTrait for Text {
         let item = item.array();
         self.item.update(item);
 
-        if self.follow && is_bottom {
+        if self.should_follow() && is_bottom {
             self.select_last()
         }
 
@@ -570,25 +686,66 @@ impl WidgetTrait for Text {
 
                 let area = HighlightArea::new().start(x, y).end(x, y);
 
-                self.highlight_content = Some(HighlightContent {
+                self.interaction_state = InteractionState::Selecting {
                     area,
-                    follow: self.follow,
-                });
-
-                self.follow = false;
+                    auto_scroll: Default::default(),
+                    last_mouse_pos: pos,
+                };
             }
 
             MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(highlight_content) = &mut self.highlight_content {
-                    let (x, y) = (pos.x + self.scroll.x, pos.y + self.scroll.y);
-                    highlight_content.area = highlight_content.area.end(x, y);
+                if let InteractionState::Selecting { .. } = self.interaction_state {
+                    let inner_chunk = self.inner_chunk();
+
+                    // スクロール方向を判定
+                    let vertical_scroll = if ev.row <= inner_chunk.top() {
+                        // 1行目以下（1行目も枠外も含む）
+                        self.select_prev(1);
+                        AutoScrollDirection::Up
+                    } else if ev.row >= inner_chunk.bottom().saturating_sub(1) {
+                        // 最終行以上（最終行も枠外も含む）
+                        self.select_next(1);
+                        AutoScrollDirection::Down
+                    } else {
+                        AutoScrollDirection::None
+                    };
+
+                    // 横方向の境界チェックとスクロール（wrap無効時のみ）
+                    let horizontal_scroll = if !self.wrap {
+                        if ev.column <= inner_chunk.left() {
+                            // 1列目以下（1列目も枠外も含む）
+                            self.scroll_left(1);
+                            AutoScrollDirection::Left
+                        } else if ev.column >= inner_chunk.right().saturating_sub(1) {
+                            // 最終列以上（最終列も枠外も含む）
+                            self.scroll_right(1);
+                            AutoScrollDirection::Right
+                        } else {
+                            AutoScrollDirection::None
+                        }
+                    } else {
+                        AutoScrollDirection::None
+                    };
+
+                    // スクロール後の座標で選択範囲を更新し、スクロール方向とマウス位置を記録
+                    if let InteractionState::Selecting {
+                        area,
+                        auto_scroll,
+                        last_mouse_pos,
+                    } = &mut self.interaction_state
+                    {
+                        let (x, y) = (pos.x + self.scroll.x, pos.y + self.scroll.y);
+                        *area = area.end(x, y);
+                        *auto_scroll = (vertical_scroll, horizontal_scroll);
+                        *last_mouse_pos = pos;
+                    }
                 }
             }
 
             // ハイライトの削除とクリップボードに保存
             MouseEventKind::Up(MouseButton::Left) => {
-                if let Some(highlight_content) = &mut self.highlight_content {
-                    let area = highlight_content.area.area();
+                if let InteractionState::Selecting { area, .. } = &self.interaction_state {
+                    let area = area.area();
 
                     let lines = &self.item.wrapped_lines();
 
@@ -600,53 +757,32 @@ impl WidgetTrait for Text {
                         y: area.end.y.min(lines.len().saturating_sub(1)),
                     };
 
+                    let collect_symbols = |graphemes: &[StyledGrapheme]| -> String {
+                        graphemes.iter().map(StyledGrapheme::symbol).collect()
+                    };
+
                     for i in start.y..=end.y {
                         let line = &lines[i];
-                        let len = line.line().len().saturating_sub(1);
+                        let graphemes = line.line();
+                        let len = graphemes.len().saturating_sub(1);
 
-                        match i {
+                        let slice = match i {
                             i if start.y == i && end.y == i => {
-                                let start = start.x.min(len);
-                                let end = end.x.min(len);
-
-                                if let Some(content) = line.line().get(start..=end) {
-                                    contents += &content
-                                        .iter()
-                                        .map(StyledGrapheme::symbol)
-                                        .collect::<String>();
-                                }
+                                graphemes.get(start.x.min(len)..=end.x.min(len))
                             }
                             i if start.y == i => {
-                                let start = start.x;
-
-                                if len < start {
-                                    continue;
-                                }
-
-                                if let Some(content) = line.line().get(start..) {
-                                    contents += &content
-                                        .iter()
-                                        .map(StyledGrapheme::symbol)
-                                        .collect::<String>();
+                                if len < start.x {
+                                    None
+                                } else {
+                                    graphemes.get(start.x..)
                                 }
                             }
-                            i if end.y == i => {
-                                let end = end.x.min(len);
+                            i if end.y == i => graphemes.get(..=end.x.min(len)),
+                            _ => Some(graphemes),
+                        };
 
-                                if let Some(content) = line.line().get(..=end) {
-                                    contents += &content
-                                        .iter()
-                                        .map(StyledGrapheme::symbol)
-                                        .collect::<String>();
-                                }
-                            }
-                            _ => {
-                                contents += &line
-                                    .line()
-                                    .iter()
-                                    .map(StyledGrapheme::symbol)
-                                    .collect::<String>();
-                            }
+                        if let Some(slice) = slice {
+                            contents += &collect_symbols(slice);
                         }
 
                         if i != end.y {
@@ -664,11 +800,10 @@ impl WidgetTrait for Text {
                             logger!(error, "Clipboard Error '{}'", e);
                         }
                     }
-
-                    self.follow = highlight_content.follow;
                 }
 
-                self.highlight_content = None;
+                self.interaction_state = InteractionState::Idle;
+                self.flush_pending_items();
             }
             MouseEventKind::ScrollDown => {
                 self.select_next(5);
@@ -686,80 +821,84 @@ impl WidgetTrait for Text {
         use KeyCode::*;
 
         match self.mode {
-            Mode::Normal | Mode::SearchConfirm => match key_event_to_code(ev) {
-                Char('j') | Down => {
-                    self.select_next(1);
-                }
-
-                Char('k') | Up => {
-                    self.select_prev(1);
-                }
-
-                PageDown => {
-                    self.select_next(self.chunk.height as usize);
-                }
-
-                PageUp => {
-                    self.select_prev(self.chunk.height as usize);
-                }
-
-                Char('G') | End => {
-                    self.select_last();
-                }
-
-                Char('g') | Home => {
-                    self.select_first();
-                }
-
-                Left => {
-                    self.scroll_left(1);
-                }
-
-                Right => {
-                    self.scroll_right(1);
-                }
-
-                Char('/') => {
-                    self.search();
-                }
-
-                Char('q') | Esc if self.mode.is_search_confirm() => {
-                    self.search_cancel();
-                }
-
-                Char('n') if !self.mode.is_normal() => {
-                    self.search_next();
-                }
-
-                Char('N') if !self.mode.is_normal() => {
-                    self.search_prev();
-                }
-
-                _ => {
-                    if let Some(cb) = self.match_action(UserEvent::Key(ev)) {
-                        return EventResult::Callback(cb.clone());
+            Mode::Normal | Mode::SearchConfirm => {
+                match key_event_to_code(ev) {
+                    Char('j') | Down => {
+                        self.select_next(1);
                     }
-                    return EventResult::Ignore;
+
+                    Char('k') | Up => {
+                        self.select_prev(1);
+                    }
+
+                    PageDown => {
+                        self.select_next(self.chunk.height as usize);
+                    }
+
+                    PageUp => {
+                        self.select_prev(self.chunk.height as usize);
+                    }
+
+                    Char('G') | End => {
+                        self.select_last();
+                    }
+
+                    Char('g') | Home => {
+                        self.select_first();
+                    }
+
+                    Left => {
+                        self.scroll_left(1);
+                    }
+
+                    Right => {
+                        self.scroll_right(1);
+                    }
+
+                    Char('/') => {
+                        self.search();
+                    }
+
+                    Char('q') | Esc if self.mode.is_search_confirm() => {
+                        self.search_cancel();
+                    }
+
+                    Char('n') if !self.mode.is_normal() => {
+                        self.search_next();
+                    }
+
+                    Char('N') if !self.mode.is_normal() => {
+                        self.search_prev();
+                    }
+
+                    _ => {
+                        if let Some(cb) = self.match_action(UserEvent::Key(ev)) {
+                            return EventResult::Callback(cb.clone());
+                        }
+                        return EventResult::Ignore;
+                    }
                 }
-            },
+            }
 
-            Mode::SearchInput => match key_event_to_code(ev) {
-                Enter => {
-                    self.mode.search_confirm();
+            Mode::SearchInput => {
+                match key_event_to_code(ev) {
+                    Enter => {
+                        self.mode.search_confirm();
+                    }
+
+                    Esc => {
+                        self.search_cancel();
+                    }
+
+                    _ => {
+                        let ev = self.search_form.on_key_event(ev);
+
+                        self.search();
+
+                        return ev;
+                    }
                 }
-
-                Esc => {
-                    self.search_cancel();
-                }
-
-                _ => {
-                    let ev = self.search_form.on_key_event(ev);
-
-                    self.search();
-
-                    return ev;
-                }
-            },
+            }
         }
 
         EventResult::Nop
@@ -783,7 +922,7 @@ impl WidgetTrait for Text {
             search_height,
         ));
 
-        if self.follow && is_bottom {
+        if self.should_follow() && is_bottom {
             self.select_last()
         }
 
@@ -801,8 +940,11 @@ impl WidgetTrait for Text {
             None
         };
 
-        self.item = TextItem::new(vec![], wrap_width);
+        self.item = TextItem::new(vec![], wrap_width, self.theme.search.clone());
+        self.item.set_max_lines(self.default_max_lines);
         self.search_cancel();
+
+        self.interaction_state = InteractionState::Idle;
 
         *(self.widget_base.append_title_mut()) = None;
     }
@@ -822,10 +964,11 @@ impl RenderTrait for Text {
         let mut builder = Render::builder()
             .block(block)
             .lines(wrapped_lines)
+            .highlight_style(self.theme.selection)
             .scroll(self.scroll);
 
-        if let Some(highlight_content) = &self.highlight_content {
-            builder = builder.highlight_area(Some(highlight_content.area));
+        if let InteractionState::Selecting { area, .. } = &self.interaction_state {
+            builder = builder.highlight_area(Some(*area));
         }
 
         let r = builder.build();

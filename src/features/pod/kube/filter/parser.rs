@@ -3,12 +3,13 @@ use std::borrow::Cow;
 use nom::{
     branch::alt,
     bytes::complete::{is_not, tag},
-    character::complete::{alphanumeric1, anychar, char, multispace0, multispace1},
+    character::complete::{alphanumeric1, anychar, char, digit1, multispace0, multispace1},
     combinator::{all_consuming, map, recognize, value, verify},
     error::{ContextError, ParseError},
     multi::{fold_many0, many1_count, separated_list1},
     sequence::{delimited, preceded, separated_pair},
     IResult,
+    Parser,
 };
 
 use super::{FilterAttribute, SpecifiedResource};
@@ -16,23 +17,24 @@ use super::{FilterAttribute, SpecifiedResource};
 /// 空白文字を含まない文字列をパースする
 fn non_space<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&str, Cow<'_, str>, E> {
-    let (remaining, value) = verify(is_not(" \t\r\n"), |s: &str| !s.starts_with(['"', '\'']))(s)?;
+) -> IResult<&'a str, Cow<'a, str>, E> {
+    let (remaining, value) =
+        verify(is_not(" \t\r\n"), |s: &str| !s.starts_with(['"', '\''])).parse(s)?;
     Ok((remaining, Cow::Borrowed(value)))
 }
 
 fn quoted<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, Cow<'_, str>, E> {
+) -> IResult<&'a str, Cow<'a, str>, E> {
     #[inline]
     fn multispace<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
-    ) -> impl FnMut(&'a str) -> IResult<&'a str, Cow<'_, str>, E> {
+    ) -> impl Parser<&'a str, Output = Cow<'a, str>, Error = E> {
         map(multispace1, Cow::Borrowed)
     }
 
     #[inline]
     fn escaped_char<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
-    ) -> impl FnMut(&'a str) -> IResult<&'a str, Cow<'_, str>, E> {
+    ) -> impl Parser<&'a str, Output = Cow<'a, str>, Error = E> {
         preceded(
             char('\\'),
             alt((
@@ -47,7 +49,7 @@ fn quoted<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     #[inline]
     fn not_quote_slash<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
         quote_slash: &'a str,
-    ) -> impl FnMut(&'a str) -> IResult<&'a str, Cow<'_, str>, E> {
+    ) -> impl Parser<&'a str, Output = Cow<'a, str>, Error = E> {
         map(
             verify(is_not(quote_slash), |s: &str| !s.is_empty()),
             Cow::Borrowed,
@@ -56,8 +58,8 @@ fn quoted<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
 
     #[inline]
     fn fold<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
-        parser: impl FnMut(&'a str) -> IResult<&'a str, Cow<'_, str>, E>,
-    ) -> impl FnMut(&'a str) -> IResult<&'a str, String, E> {
+        parser: impl Parser<&'a str, Output = Cow<'a, str>, Error = E>,
+    ) -> impl Parser<&'a str, Output = String, Error = E> {
         fold_many0(parser, String::default, |mut s, parsed| {
             s.push_str(&parsed);
             s
@@ -84,125 +86,183 @@ fn quoted<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
         char('\''),
     );
 
-    let (remaining, value) = alt((double_quoted, single_quoted))(s)?;
+    let (remaining, value) = alt((double_quoted, single_quoted)).parse(s)?;
 
     Ok((remaining, Cow::Owned(value)))
 }
 
 fn unquoted<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, Cow<'_, str>, E> {
+) -> IResult<&'a str, Cow<'a, str>, E> {
     non_space(s)
 }
 
 fn regex<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, Cow<'_, str>, E> {
-    alt((quoted, unquoted))(s)
+) -> IResult<&'a str, Cow<'a, str>, E> {
+    alt((quoted, unquoted)).parse(s)
 }
 
 fn selector<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, Cow<'_, str>, E> {
-    alt((quoted, unquoted))(s)
+) -> IResult<&'a str, Cow<'a, str>, E> {
+    alt((quoted, unquoted)).parse(s)
+}
+
+fn jq_expr<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
+    s: &'a str,
+) -> IResult<&'a str, Cow<'a, str>, E> {
+    alt((quoted, unquoted)).parse(s)
 }
 
 fn resource_name<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&str, &str, E> {
-    recognize(many1_count(alt((alphanumeric1, tag("-"), tag(".")))))(s)
+) -> IResult<&'a str, &'a str, E> {
+    recognize(many1_count(alt((alphanumeric1, tag("-"), tag("."))))).parse(s)
 }
 
 fn pod<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, (_, value)) = separated_pair(
         alt((tag("pods"), tag("pod"), tag("po"), tag("p"))),
         char(':'),
         regex,
-    )(s)?;
+    )
+    .parse(s)?;
     Ok((remaining, FilterAttribute::Pod(value)))
 }
 
 fn exclude_pod<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, (_, value)) = separated_pair(
         alt((tag("!pods"), tag("!pod"), tag("!po"), tag("!p"))),
         char(':'),
         regex,
-    )(s)?;
+    )
+    .parse(s)?;
     Ok((remaining, FilterAttribute::ExcludePod(value)))
 }
 
 fn container<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, (_, value)) = separated_pair(
         alt((tag("containers"), tag("container"), tag("co"), tag("c"))),
         char(':'),
         regex,
-    )(s)?;
+    )
+    .parse(s)?;
     Ok((remaining, FilterAttribute::Container(value)))
 }
 
 fn exclude_container<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, (_, value)) = separated_pair(
         alt((tag("!containers"), tag("!container"), tag("!co"), tag("!c"))),
         char(':'),
         regex,
-    )(s)?;
+    )
+    .parse(s)?;
     Ok((remaining, FilterAttribute::ExcludeContainer(value)))
 }
 
 fn include_log<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, (_, value)) = separated_pair(
         alt((tag("logs"), tag("log"), tag("lo"), tag("l"))),
         char(':'),
         regex,
-    )(s)?;
+    )
+    .parse(s)?;
     Ok((remaining, FilterAttribute::IncludeLog(value)))
 }
 
 fn exclude_log<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, (_, value)) = separated_pair(
         alt((tag("!logs"), tag("!log"), tag("!lo"), tag("!l"))),
         char(':'),
         regex,
-    )(s)?;
+    )
+    .parse(s)?;
     Ok((remaining, FilterAttribute::ExcludeLog(value)))
 }
 
 fn label_selector<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, (_, value)) =
-        separated_pair(alt((tag("labels"), tag("label"))), char(':'), selector)(s)?;
+        separated_pair(alt((tag("labels"), tag("label"))), char(':'), selector).parse(s)?;
     Ok((remaining, FilterAttribute::LabelSelector(value)))
 }
 
 fn field_selector<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, (_, value)) =
-        separated_pair(alt((tag("fields"), tag("field"))), char(':'), selector)(s)?;
+        separated_pair(alt((tag("fields"), tag("field"))), char(':'), selector).parse(s)?;
     Ok((remaining, FilterAttribute::FieldSelector(value)))
+}
+
+fn jq<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
+    s: &'a str,
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
+    let (remaining, (_, value)) = separated_pair(tag("jq"), char(':'), jq_expr).parse(s)?;
+    Ok((remaining, FilterAttribute::Jq(value)))
+}
+
+/// JMESPath expression parser - accepts quoted or unquoted strings
+fn jmespath_expr<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
+    s: &'a str,
+) -> IResult<&'a str, Cow<'a, str>, E> {
+    alt((quoted, unquoted)).parse(s)
+}
+
+/// Parser for `jmespath:<expression>`, `jmes:<expression>`, or `jm:<expression>` syntax
+fn jmespath<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
+    s: &'a str,
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
+    let (remaining, (_, value)) = separated_pair(
+        alt((tag("jmespath"), tag("jmes"), tag("jm"))),
+        char(':'),
+        jmespath_expr,
+    )
+    .parse(s)?;
+    Ok((remaining, FilterAttribute::JMESPath(value)))
+}
+
+fn positive_integer<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
+    s: &'a str,
+) -> IResult<&'a str, usize, E> {
+    let (remaining, digits) = digit1(s)?;
+    let n = digits
+        .parse::<usize>()
+        .map_err(|_| nom::Err::Error(E::from_error_kind(s, nom::error::ErrorKind::Digit)))?;
+    Ok((remaining, n))
+}
+
+fn limit<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
+    s: &'a str,
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
+    let (remaining, (_, value)) =
+        separated_pair(alt((tag("limit"), tag("lim"))), char(':'), positive_integer).parse(s)?;
+    Ok((remaining, FilterAttribute::Limit(value)))
 }
 
 fn specified_daemonset<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, (_, value)) = separated_pair(
         alt((tag("daemonsets"), tag("daemonset"), tag("ds"))),
         char('/'),
         resource_name,
-    )(s)?;
+    )
+    .parse(s)?;
     Ok((
         remaining,
         FilterAttribute::from(SpecifiedResource::DaemonSet(value)),
@@ -211,12 +271,13 @@ fn specified_daemonset<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
 
 fn specified_deployment<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, (_, value)) = separated_pair(
         alt((tag("deployments"), tag("deployment"), tag("deploy"))),
         char('/'),
         resource_name,
-    )(s)?;
+    )
+    .parse(s)?;
     Ok((
         remaining,
         FilterAttribute::from(SpecifiedResource::Deployment(value)),
@@ -225,9 +286,9 @@ fn specified_deployment<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
 
 fn specified_job<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, (_, value)) =
-        separated_pair(alt((tag("jobs"), tag("job"))), char('/'), resource_name)(s)?;
+        separated_pair(alt((tag("jobs"), tag("job"))), char('/'), resource_name).parse(s)?;
     Ok((
         remaining,
         FilterAttribute::from(SpecifiedResource::Job(value)),
@@ -236,12 +297,13 @@ fn specified_job<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
 
 fn specified_pod<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, (_, value)) = separated_pair(
         alt((tag("pods"), tag("pod"), tag("po"))),
         char('/'),
         resource_name,
-    )(s)?;
+    )
+    .parse(s)?;
     Ok((
         remaining,
         FilterAttribute::from(SpecifiedResource::Pod(value)),
@@ -250,12 +312,13 @@ fn specified_pod<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
 
 fn specified_replicaset<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, (_, value)) = separated_pair(
         alt((tag("replicasets"), tag("replicaset"), tag("rs"))),
         char('/'),
         resource_name,
-    )(s)?;
+    )
+    .parse(s)?;
     Ok((
         remaining,
         FilterAttribute::from(SpecifiedResource::ReplicaSet(value)),
@@ -264,12 +327,13 @@ fn specified_replicaset<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
 
 fn specified_service<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, (_, value)) = separated_pair(
         alt((tag("services"), tag("service"), tag("svc"))),
         char('/'),
         resource_name,
-    )(s)?;
+    )
+    .parse(s)?;
     Ok((
         remaining,
         FilterAttribute::from(SpecifiedResource::Service(value)),
@@ -278,12 +342,13 @@ fn specified_service<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
 
 fn specified_statefulset<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, (_, value)) = separated_pair(
         alt((tag("statefulsets"), tag("statefulset"), tag("sts"))),
         char('/'),
         resource_name,
-    )(s)?;
+    )
+    .parse(s)?;
     Ok((
         remaining,
         FilterAttribute::from(SpecifiedResource::StatefulSet(value)),
@@ -292,7 +357,7 @@ fn specified_statefulset<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
 
 fn attribute<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, FilterAttribute, E> {
+) -> IResult<&'a str, FilterAttribute<'a>, E> {
     let (remaining, value) = alt((
         specified_pod,
         specified_daemonset,
@@ -303,33 +368,38 @@ fn attribute<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
         specified_statefulset,
         field_selector,
         label_selector,
+        limit,
         pod,
         exclude_pod,
         container,
         exclude_container,
         include_log,
         exclude_log,
-    ))(s)?;
+        jmespath,
+        jq,
+    ))
+    .parse(s)?;
 
     Ok((remaining, value))
 }
 
 fn split_attributes<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, Vec<FilterAttribute>, E> {
+) -> IResult<&'a str, Vec<FilterAttribute<'a>>, E> {
     let (remaining, value) = delimited(
         multispace0,
         separated_list1(multispace1, attribute),
         multispace0,
-    )(s)?;
+    )
+    .parse(s)?;
 
     Ok((remaining, value))
 }
 
 pub fn parse_attributes<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     s: &'a str,
-) -> IResult<&'a str, Vec<FilterAttribute>, E> {
-    all_consuming(split_attributes)(s)
+) -> IResult<&'a str, Vec<FilterAttribute<'a>>, E> {
+    all_consuming(split_attributes).parse(s)
 }
 
 #[cfg(test)]
@@ -443,7 +513,7 @@ mod tests {
         assert_eq!(remaining, "");
     }
 
-    /// Specified resoruces
+    // Specified resoruces
 
     /// DaemonSet
     #[rstest]
@@ -641,6 +711,41 @@ mod tests {
         assert_eq!(remaining, "");
     }
 
+    #[rstest]
+    #[case("jq:.message", ".message")]
+    #[case("jq:map('.level')", "map('.level')")]
+    fn jq(#[case] query: &str, #[case] expected: &str) {
+        let (remaining, actual) = super::jq::<Error<_>>(query).unwrap();
+
+        assert_eq!(actual, FilterAttribute::Jq(expected.into()));
+        assert_eq!(remaining, "");
+    }
+
+    #[rstest]
+    #[case("jmespath:message", "message")]
+    #[case("jmes:level", "level")]
+    #[case("jm:data.userId", "data.userId")]
+    #[case("jmespath:[0]", "[0]")]
+    #[case("jmes:items[*].name", "items[*].name")]
+    fn jmespath(#[case] query: &str, #[case] expected: &str) {
+        let (remaining, actual) = super::jmespath::<Error<_>>(query).unwrap();
+
+        assert_eq!(actual, FilterAttribute::JMESPath(expected.into()));
+        assert_eq!(remaining, "");
+    }
+
+    #[rstest]
+    #[case("limit:5000", 5000)]
+    #[case("lim:5000", 5000)]
+    #[case("limit:1", 1)]
+    #[case("limit:100000", 100000)]
+    fn limit(#[case] query: &str, #[case] expected: usize) {
+        let (remaining, actual) = super::limit::<Error<_>>(query).unwrap();
+
+        assert_eq!(actual, FilterAttribute::Limit(expected));
+        assert_eq!(remaining, "");
+    }
+
     #[rustfmt::skip]
     #[rstest]
     #[case("pod:hoge", FilterAttribute::Pod("hoge".into()))]
@@ -658,6 +763,12 @@ mod tests {
     #[case("replicaset/app", FilterAttribute::Resource(SpecifiedResource::ReplicaSet("app")))]
     #[case("service/app", FilterAttribute::Resource(SpecifiedResource::Service("app")))]
     #[case("statefulset/app", FilterAttribute::Resource(SpecifiedResource::StatefulSet("app")))]
+    #[case("jq:.message", FilterAttribute::Jq(".message".into()))]
+    #[case("jmespath:message", FilterAttribute::JMESPath("message".into()))]
+    #[case("jmes:level", FilterAttribute::JMESPath("level".into()))]
+    #[case("jm:data.id", FilterAttribute::JMESPath("data.id".into()))]
+    #[case("limit:5000", FilterAttribute::Limit(5000))]
+    #[case("lim:1000", FilterAttribute::Limit(1000))]
     fn attribute(#[case] query: &str, #[case] expected: FilterAttribute) {
         let (remaining, actual) = super::attribute::<Error<_>>(query).unwrap();
 
@@ -684,6 +795,9 @@ mod tests {
             "replicaset/app",
             "service/app",
             "statefulset/app",
+            "jq:.message",
+            "jmespath:data.id",
+            "limit:5000",
             "     ",
         ]
         .join("  ");
@@ -706,6 +820,9 @@ mod tests {
             FilterAttribute::Resource(SpecifiedResource::ReplicaSet("app")),
             FilterAttribute::Resource(SpecifiedResource::Service("app")),
             FilterAttribute::Resource(SpecifiedResource::StatefulSet("app")),
+            FilterAttribute::Jq(".message".into()),
+            FilterAttribute::JMESPath("data.id".into()),
+            FilterAttribute::Limit(5000),
         ];
 
         assert_eq!(actual, expected);

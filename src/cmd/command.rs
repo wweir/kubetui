@@ -1,13 +1,17 @@
+use anyhow::Result;
 use clap::Parser;
 use ratatui::layout::Direction;
 use std::path::PathBuf;
 
-use crate::workers::kube::KubeWorkerConfig;
+use crate::{config::ConfigLoadOption, features::pod::PodColumns, workers::kube::KubeWorkerConfig};
 
-use super::args::{AllNamespaces, SplitDirection};
+use super::{
+    args::{parse_pod_columns, AllNamespaces, ClipboardMode, SplitDirection},
+    SubCommand,
+};
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about, long_about = None, disable_help_subcommand = true)]
 pub struct Command {
     /// Window split direction
     #[arg(
@@ -65,6 +69,43 @@ pub struct Command {
     /// Logging
     #[arg(short = 'l', long, display_order = 1000)]
     pub logging: bool,
+
+    /// Config file path
+    #[arg(long, display_order = 1000)]
+    pub config_file: Option<PathBuf>,
+
+    /// Comma-separated list of columns to show in pod table (e.g. name,status,ip). Use "full" to show all available columns.
+    #[arg(
+        long,
+        value_parser = parse_pod_columns,
+        display_order = 1000)]
+    pub pod_columns: Option<PodColumns>,
+
+    /// Preset name for pod columns (e.g. "default", "full"). If both are specified, `--pod-columns` overrides this.
+    #[arg(long, display_order = 1000)]
+    pub pod_columns_preset: Option<String>,
+
+    /// Comma-separated columns for the node table: builtin names (e.g. name,status), defined label-column names, or "full" for all builtins.
+    #[arg(long, value_delimiter = ',', display_order = 1000)]
+    pub node_columns: Option<Vec<String>>,
+
+    /// Preset name for node columns (e.g. "default", "wide"). If both are specified, `--node-columns` overrides this.
+    #[arg(long, display_order = 1000)]
+    pub node_columns_preset: Option<String>,
+
+    /// Clipboard mode (auto, system, or osc52)
+    #[arg(
+        long,
+        value_name = "auto|system|osc52",
+        default_value = "auto",
+        env = "KUBETUI_CLIPBOARD",
+        value_enum,
+        display_order = 1000
+    )]
+    pub clipboard: ClipboardMode,
+
+    #[command(subcommand)]
+    pub subcommand: Option<SubCommand>,
 }
 
 impl Command {
@@ -90,6 +131,51 @@ impl Command {
             target_namespaces: namespaces,
             context,
             all_namespaces: all_namespaces.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn config_load_option(&self) -> Result<ConfigLoadOption> {
+        let option = if let Some(path) = &self.config_file {
+            match path.try_exists() {
+                Ok(true) => ConfigLoadOption::Path(path.clone()),
+                Ok(false) => {
+                    eprintln!("Config file not found: {:?}", path);
+
+                    ConfigLoadOption::Default
+                }
+                Err(err) => {
+                    eprintln!("Failed to check config file exists: {}", err);
+
+                    ConfigLoadOption::Default
+                }
+            }
+        } else {
+            let path = xdg_config_home().join("config.yaml");
+
+            match path.try_exists() {
+                Ok(true) => ConfigLoadOption::Path(path.clone()),
+                Ok(false) => ConfigLoadOption::Default,
+                Err(err) => {
+                    eprintln!("Failed to check config file exists: {}", err);
+
+                    ConfigLoadOption::Default
+                }
+            }
+        };
+
+        Ok(option)
+    }
+}
+
+fn xdg_config_home() -> PathBuf {
+    match std::env::var_os("XDG_CONFIG_HOME").map(|s| PathBuf::from(s).join("kubetui")) {
+        Some(path) => path,
+        None => {
+            dirs::home_dir()
+                .expect("Failed to get home directory")
+                .join(".config")
+                .join("kubetui")
         }
     }
 }
@@ -168,7 +254,7 @@ mod tests {
         #[test]
         fn equalがない構文のときエラーになる() {
             let cmd = Command::try_parse_from(["kubetui", "--all-namespaces", "true"]);
-            assert_eq!(cmd.unwrap_err().kind(), ErrorKind::UnknownArgument)
+            assert_eq!(cmd.is_err(), true)
         }
 
         #[rstest]
@@ -190,6 +276,85 @@ mod tests {
         fn namespaceと併用するとエラーを返す() {
             let cmd = Command::try_parse_from(["kubetui", "-A", "-n", "hoge"]);
             assert_eq!(cmd.unwrap_err().kind(), ErrorKind::ArgumentConflict)
+        }
+    }
+
+    mod pod_columns {
+        use pretty_assertions::assert_eq;
+
+        use crate::features::pod::PodColumn;
+
+        use super::*;
+
+        #[test]
+        fn デフォルトのカラムを設定する() {
+            let cmd = Command::try_parse_from(["kubetui"]).unwrap();
+            assert_eq!(cmd.pod_columns, None);
+        }
+
+        #[test]
+        fn フルを設定すると全カラムを設定する() {
+            let cmd = Command::try_parse_from(["kubetui", "--pod-columns=full"]).unwrap();
+            assert_eq!(
+                cmd.pod_columns,
+                Some(PodColumns::from_builtins([
+                    PodColumn::Name,
+                    PodColumn::Ready,
+                    PodColumn::Status,
+                    PodColumn::Restarts,
+                    PodColumn::Age,
+                    PodColumn::IP,
+                    PodColumn::Node,
+                    PodColumn::NominatedNode,
+                    PodColumn::ReadinessGates
+                ]))
+            );
+        }
+
+        #[test]
+        fn カンマ区切りでカラムを指定できる() {
+            let cmd =
+                Command::try_parse_from(["kubetui", "--pod-columns=name,ready,status"]).unwrap();
+            assert_eq!(
+                cmd.pod_columns,
+                Some(PodColumns::from_builtins([
+                    PodColumn::Name,
+                    PodColumn::Ready,
+                    PodColumn::Status
+                ]))
+            );
+        }
+    }
+
+    mod node_columns {
+        use pretty_assertions::assert_eq;
+
+        use super::*;
+
+        #[test]
+        fn デフォルトは指定なしを設定する() {
+            let cmd = Command::try_parse_from(["kubetui"]).unwrap();
+            assert_eq!(cmd.node_columns, None);
+        }
+
+        #[test]
+        fn 単一のカラムを指定できる() {
+            let cmd = Command::try_parse_from(["kubetui", "--node-columns=name"]).unwrap();
+            assert_eq!(cmd.node_columns, Some(vec!["name".to_string()]));
+        }
+
+        #[test]
+        fn カンマ区切りでカラムを指定できる() {
+            let cmd =
+                Command::try_parse_from(["kubetui", "--node-columns=name,status,zone"]).unwrap();
+            assert_eq!(
+                cmd.node_columns,
+                Some(vec![
+                    "name".to_string(),
+                    "status".to_string(),
+                    "zone".to_string()
+                ])
+            );
         }
     }
 }

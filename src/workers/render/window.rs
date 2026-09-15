@@ -17,13 +17,21 @@ use ratatui::{
 
 use crate::{
     clipboard::Clipboard,
+    cmd::ClipboardMode,
+    config::theme::ThemeConfig,
     features::{
-        api_resources::view::ListTab,
+        api_resources::view::ApiTab,
         component_id::{
-            CONFIG_WIDGET_ID, CONTEXT_DIALOG_ID, HELP_DIALOG_ID, MULTIPLE_NAMESPACES_DIALOG_ID,
-            NETWORK_WIDGET_ID, POD_WIDGET_ID, SINGLE_NAMESPACE_DIALOG_ID, YAML_DIALOG_ID,
+            CONFIG_WIDGET_ID,
+            CONTEXT_DIALOG_ID,
+            HELP_DIALOG_ID,
+            MULTIPLE_NAMESPACES_DIALOG_ID,
+            NETWORK_WIDGET_ID,
+            POD_WIDGET_ID,
+            SINGLE_NAMESPACE_DIALOG_ID,
+            YAML_DIALOG_ID,
         },
-        config::view::ConfigTab,
+        config::{view::ConfigTab, ConfigColumns, ConfigLabelColumn},
         context::{message::ContextRequest, view::ContextDialog},
         event::view::EventTab,
         get::{
@@ -38,8 +46,11 @@ use crate::{
         network::{
             message::{GatewayVersion, HTTPRouteVersion},
             view::NetworkTab,
+            NetworkColumns,
+            NetworkLabelColumn,
         },
-        pod::view::PodTab,
+        node::{view::NodeTab, NodeColumns, NodeLabelColumn},
+        pod::{view::PodTab, PodColumns, PodLabelColumn},
         yaml::view::YamlTab,
     },
     kube::{
@@ -49,10 +60,15 @@ use crate::{
     logger,
     message::{Message, UserEvent},
     ui::{
-        dialog::Dialog,
+        dialog::{Dialog, DialogTheme},
         event::{CallbackFn, EventResult},
         widget::{SelectedItem, WidgetTrait},
-        Header, Tab, Window, WindowAction,
+        Header,
+        HeaderTheme,
+        Tab,
+        TabTheme,
+        Window,
+        WindowAction,
     },
 };
 
@@ -61,6 +77,17 @@ pub struct WindowInit {
     tx: Sender<Message>,
     context: Rc<RefCell<Context>>,
     namespaces: Rc<RefCell<Namespace>>,
+    default_pod_columns: Option<PodColumns>,
+    default_node_columns: Option<NodeColumns>,
+    default_config_columns: ConfigColumns,
+    default_network_columns: NetworkColumns,
+    pod_label_columns: Vec<PodLabelColumn>,
+    node_label_columns: Vec<NodeLabelColumn>,
+    config_label_columns: Vec<ConfigLabelColumn>,
+    network_label_columns: Vec<NetworkLabelColumn>,
+    theme: ThemeConfig,
+    clipboard_mode: ClipboardMode,
+    log_max_lines: Option<usize>,
 }
 
 impl WindowInit {
@@ -69,12 +96,34 @@ impl WindowInit {
         tx: Sender<Message>,
         context: Rc<RefCell<Context>>,
         namespaces: Rc<RefCell<Namespace>>,
+        default_pod_columns: Option<PodColumns>,
+        default_node_columns: Option<NodeColumns>,
+        default_config_columns: ConfigColumns,
+        default_network_columns: NetworkColumns,
+        pod_label_columns: Vec<PodLabelColumn>,
+        node_label_columns: Vec<NodeLabelColumn>,
+        config_label_columns: Vec<ConfigLabelColumn>,
+        network_label_columns: Vec<NetworkLabelColumn>,
+        theme: ThemeConfig,
+        clipboard_mode: ClipboardMode,
+        log_max_lines: Option<usize>,
     ) -> Self {
         Self {
             split_mode,
             tx,
             context,
             namespaces,
+            default_pod_columns,
+            default_node_columns,
+            default_config_columns,
+            default_network_columns,
+            pod_label_columns,
+            node_label_columns,
+            config_label_columns,
+            network_label_columns,
+            theme,
+            clipboard_mode,
+            log_max_lines,
         }
     }
 
@@ -149,73 +198,129 @@ impl WindowInit {
         let context = self.context.clone();
         let namespaces = self.namespaces.clone();
 
-        let header = Header::new_callback(2, move || {
+        let header = Header::new_callback(2, move |theme: &HeaderTheme| {
             let context = context.borrow();
             let namespaces = namespaces.borrow();
+
             Paragraph::new(vec![
-                Line::from(format!(" ctx: {}", context)),
-                Line::from(format!(" ns: {}", namespaces)),
+                Line::from(format!(" ctx: {}", context)).style(theme.line_styles[0]),
+                Line::from(format!(" ns: {}", namespaces)).style(theme.line_styles[1]),
             ])
+            .style(theme.base_style)
         });
 
         let builder = builder.header(header);
+
+        let tab_theme = TabTheme::from(self.theme.clone());
+
+        let builder = builder.tab_theme(tab_theme);
+
+        let header_theme = HeaderTheme::from(self.theme.clone());
+
+        let builder = builder.header_theme(header_theme);
+
+        let builder = builder.base_style(self.theme.base);
 
         builder.build()
     }
 
     fn tabs_dialogs(&self) -> (Vec<Tab<'static>>, Vec<Dialog<'static>>) {
-        let clipboard = Some(Rc::new(RefCell::new(Clipboard::new())));
+        let clipboard =
+            Clipboard::new(self.clipboard_mode).map(|clipboard| Rc::new(RefCell::new(clipboard)));
 
         let PodTab {
             tab: pod_tab,
             log_query_help_dialog,
+            pod_columns_dialog,
+            pod_filter_help_dialog,
         } = PodTab::new(
             "Pod",
             &self.tx,
             &clipboard,
             self.split_mode,
             self.namespaces.clone(),
+            self.default_pod_columns.clone(),
+            self.pod_label_columns.clone(),
+            self.theme.component.clone(),
+            self.log_max_lines,
         );
 
-        let ConfigTab { tab: config_tab } =
-            ConfigTab::new("Config", &self.tx, &clipboard, self.split_mode);
+        let ConfigTab {
+            tab: config_tab,
+            config_columns_dialog,
+            config_filter_help_dialog,
+        } = ConfigTab::new(
+            "Config",
+            &self.tx,
+            &clipboard,
+            self.split_mode,
+            self.default_config_columns.clone(),
+            self.config_label_columns.clone(),
+            self.theme.component.clone(),
+        );
 
-        let NetworkTab { tab: network_tab } =
-            NetworkTab::new("Network", &self.tx, &clipboard, self.split_mode);
+        let NetworkTab {
+            tab: network_tab,
+            network_columns_dialog,
+            network_filter_help_dialog,
+        } = NetworkTab::new(
+            "Network",
+            &self.tx,
+            &clipboard,
+            self.split_mode,
+            self.default_network_columns.clone(),
+            self.network_label_columns.clone(),
+            self.theme.component.clone(),
+        );
 
-        let EventTab { tab: event_tab } = EventTab::new("Event", &clipboard);
+        let EventTab { tab: event_tab } =
+            EventTab::new("Event", &clipboard, self.theme.component.clone());
 
-        let ListTab {
-            tab: list_tab,
-            dialog: list_dialog,
-        } = ListTab::new("List", &self.tx, &clipboard);
+        let NodeTab {
+            tab: node_tab,
+            node_columns_dialog,
+            node_filter_help_dialog,
+        } = NodeTab::new(
+            "Node",
+            &self.tx,
+            &clipboard,
+            self.split_mode,
+            self.default_node_columns.clone(),
+            self.node_label_columns.clone(),
+            self.theme.component.clone(),
+        );
+
+        let ApiTab {
+            tab: api_tab,
+            dialog: api_dialog,
+        } = ApiTab::new("API", &self.tx, &clipboard, self.theme.component.clone());
 
         let YamlTab {
             tab: yaml_tab,
             kind_dialog: yaml_kind_dialog,
             name_dialog: yaml_name_dialog,
             not_found_dialog: yaml_not_found_dialog,
-        } = YamlTab::new("Yaml", &self.tx, &clipboard);
+        } = YamlTab::new("Yaml", &self.tx, &clipboard, self.theme.component.clone());
 
         let ContextDialog {
             widget: context_dialog,
-        } = ContextDialog::new(&self.tx);
+        } = ContextDialog::new(&self.tx, self.theme.clone());
 
         let SingleNamespaceDialog {
             widget: single_namespace_dialog,
-        } = SingleNamespaceDialog::new(&self.tx);
+        } = SingleNamespaceDialog::new(&self.tx, self.theme.clone());
 
         let MultipleNamespacesDialog {
             widget: multiple_namespaces_dialog,
-        } = MultipleNamespacesDialog::new(&self.tx);
+        } = MultipleNamespacesDialog::new(&self.tx, self.theme.clone());
 
         let HelpDialog {
             widget: help_dialog,
-        } = HelpDialog::new();
+        } = HelpDialog::new(self.theme.clone());
 
         let YamlDialog {
             widget: yaml_dialog,
-        } = YamlDialog::new(&clipboard);
+        } = YamlDialog::new(&clipboard, self.theme.clone());
 
         // Init Window
         let tabs = vec![
@@ -223,22 +328,43 @@ impl WindowInit {
             config_tab,
             network_tab,
             event_tab,
-            list_tab,
+            node_tab,
+            api_tab,
             yaml_tab,
         ];
 
-        let dialogs = vec![
-            Dialog::new(context_dialog),
-            Dialog::new(single_namespace_dialog),
-            Dialog::new(multiple_namespaces_dialog),
-            Dialog::new(list_dialog),
-            Dialog::new(yaml_kind_dialog),
-            Dialog::new(yaml_name_dialog),
-            Dialog::new(yaml_not_found_dialog),
-            Dialog::new(help_dialog),
-            Dialog::new(log_query_help_dialog),
-            Dialog::new(yaml_dialog),
+        let dialog_theme = DialogTheme::from(self.theme.clone());
+
+        let dialog_widgets = vec![
+            context_dialog,
+            single_namespace_dialog,
+            multiple_namespaces_dialog,
+            api_dialog,
+            yaml_kind_dialog,
+            yaml_name_dialog,
+            yaml_not_found_dialog,
+            help_dialog,
+            log_query_help_dialog,
+            pod_columns_dialog,
+            pod_filter_help_dialog,
+            config_filter_help_dialog,
+            config_columns_dialog,
+            network_filter_help_dialog,
+            network_columns_dialog,
+            node_columns_dialog,
+            node_filter_help_dialog,
+            yaml_dialog,
         ];
+
+        let dialogs: Vec<Dialog> = dialog_widgets
+            .into_iter()
+            .map(|widget| {
+                Dialog::builder()
+                    .widget(widget)
+                    .theme(dialog_theme.clone())
+                    .build()
+            })
+            .collect();
 
         (tabs, dialogs)
     }
@@ -280,16 +406,20 @@ fn open_yaml(tx: Sender<Message>) -> impl CallbackFn {
             Some(Ingress::KIND) => GetYamlKind::Ingress,
             Some(Service::KIND) => GetYamlKind::Service,
             Some(NetworkPolicy::KIND) => GetYamlKind::NetworkPolicy,
-            Some(Gateway::KIND) => match version.as_ref().map(|v| v.as_str()) {
-                Some("v1") => GetYamlKind::Gateway(GatewayVersion::V1),
-                Some("v1beta1") => GetYamlKind::Gateway(GatewayVersion::V1Beta1),
-                _ => unreachable!(),
-            },
-            Some(HTTPRoute::KIND) => match version.as_ref().map(|v| v.as_str()) {
-                Some("v1") => GetYamlKind::HTTPRoute(HTTPRouteVersion::V1),
-                Some("v1beta1") => GetYamlKind::HTTPRoute(HTTPRouteVersion::V1Beta1),
-                _ => unreachable!(),
-            },
+            Some(Gateway::KIND) => {
+                match version.as_ref().map(|v| v.as_str()) {
+                    Some("v1") => GetYamlKind::Gateway(GatewayVersion::V1),
+                    Some("v1beta1") => GetYamlKind::Gateway(GatewayVersion::V1Beta1),
+                    _ => unreachable!(),
+                }
+            }
+            Some(HTTPRoute::KIND) => {
+                match version.as_ref().map(|v| v.as_str()) {
+                    Some("v1") => GetYamlKind::HTTPRoute(HTTPRouteVersion::V1),
+                    Some("v1beta1") => GetYamlKind::HTTPRoute(HTTPRouteVersion::V1Beta1),
+                    _ => unreachable!(),
+                }
+            }
             _ => {
                 unreachable!();
             }

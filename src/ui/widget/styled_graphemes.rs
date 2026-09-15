@@ -55,45 +55,17 @@ pub trait StyledGraphemes {
     fn styled_graphemes_width(&self) -> usize;
 }
 
-impl StyledGraphemes for String {
+impl<T: AsRef<str>> StyledGraphemes for T {
     fn styled_graphemes(&self) -> Vec<StyledGrapheme> {
-        styled_graphemes(self)
+        styled_graphemes(self.as_ref())
     }
 
     fn styled_graphemes_symbols(&self) -> Vec<&str> {
-        styled_graphemes_symbols(self)
+        styled_graphemes_symbols(self.as_ref())
     }
 
     fn styled_graphemes_width(&self) -> usize {
-        styled_graphemes_symbols(self).concat().width()
-    }
-}
-
-impl StyledGraphemes for &String {
-    fn styled_graphemes(&self) -> Vec<StyledGrapheme> {
-        styled_graphemes(self)
-    }
-
-    fn styled_graphemes_symbols(&self) -> Vec<&str> {
-        styled_graphemes_symbols(self)
-    }
-
-    fn styled_graphemes_width(&self) -> usize {
-        styled_graphemes_symbols(self).concat().width()
-    }
-}
-
-impl StyledGraphemes for &str {
-    fn styled_graphemes(&self) -> Vec<StyledGrapheme> {
-        styled_graphemes(self)
-    }
-
-    fn styled_graphemes_symbols(&self) -> Vec<&str> {
-        styled_graphemes_symbols(self)
-    }
-
-    fn styled_graphemes_width(&self) -> usize {
-        styled_graphemes_symbols(self).concat().width()
+        styled_graphemes_symbols(self.as_ref()).concat().width()
     }
 }
 
@@ -102,13 +74,15 @@ pub fn styled_graphemes(s: &str) -> Vec<StyledGrapheme> {
     let mut style = Style::default();
 
     s.ansi_parse()
-        .filter_map(|p| match p.ty {
-            AnsiEscapeSequence::Chars => Some(StyledGrapheme::new(p.chars, style)),
-            AnsiEscapeSequence::SelectGraphicRendition(sgr) => {
-                style = Sgr::from(sgr).into();
-                None
+        .filter_map(|p| {
+            match p.ty {
+                AnsiEscapeSequence::Chars => Some(StyledGrapheme::new(p.chars, style)),
+                AnsiEscapeSequence::SelectGraphicRendition(sgr) => {
+                    style = Sgr::from(sgr).into();
+                    None
+                }
+                _ => None,
             }
-            _ => None,
         })
         .flat_map(|sg| {
             sg.symbol()
@@ -122,9 +96,11 @@ pub fn styled_graphemes(s: &str) -> Vec<StyledGrapheme> {
 
 fn styled_graphemes_symbols(s: &str) -> Vec<&'_ str> {
     s.ansi_parse()
-        .filter_map(|p| match p.ty {
-            AnsiEscapeSequence::Chars => Some(p.chars),
-            _ => None,
+        .filter_map(|p| {
+            match p.ty {
+                AnsiEscapeSequence::Chars => Some(p.chars),
+                _ => None,
+            }
         })
         .flat_map(|chars| {
             chars

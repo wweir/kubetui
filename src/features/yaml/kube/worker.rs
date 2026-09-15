@@ -1,5 +1,3 @@
-use std::sync::{atomic::AtomicBool, Arc};
-
 use anyhow::{anyhow, Result};
 use crossbeam::channel::Sender;
 use serde_yaml::Value;
@@ -12,7 +10,7 @@ use crate::{
     kube::KubeClientRequest,
     logger,
     message::Message,
-    workers::kube::AbortWorker,
+    workers::kube::InfiniteWorker,
 };
 
 #[derive(Debug, Clone)]
@@ -27,7 +25,6 @@ pub struct YamlWorker<C>
 where
     C: KubeClientRequest,
 {
-    is_terminated: Arc<AtomicBool>,
     tx: Sender<Message>,
     client: C,
     req: YamlTarget,
@@ -36,14 +33,12 @@ where
 
 impl<C: KubeClientRequest> YamlWorker<C> {
     pub fn new(
-        is_terminated: Arc<AtomicBool>,
         tx: Sender<Message>,
         client: C,
         shared_api_resources: SharedApiResources,
         req: YamlTarget,
     ) -> Self {
         Self {
-            is_terminated,
             tx,
             client,
             req,
@@ -53,7 +48,7 @@ impl<C: KubeClientRequest> YamlWorker<C> {
 }
 
 #[async_trait::async_trait]
-impl<C: KubeClientRequest> AbortWorker for YamlWorker<C> {
+impl<C: KubeClientRequest> InfiniteWorker for YamlWorker<C> {
     async fn run(&self) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
 
@@ -63,10 +58,7 @@ impl<C: KubeClientRequest> AbortWorker for YamlWorker<C> {
             namespace,
         } = &self.req;
 
-        while !self
-            .is_terminated
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        loop {
             interval.tick().await;
 
             let api_resources = self.shared_api_resources.read().await;
@@ -80,9 +72,10 @@ impl<C: KubeClientRequest> AbortWorker for YamlWorker<C> {
             )
             .await;
 
-            self.tx
-                .send(YamlResponse::Yaml(fetched_data).into())
-                .expect("Failed to send YamlResponse::Yaml");
+            if let Err(e) = self.tx.send(YamlResponse::Yaml(fetched_data).into()) {
+                logger!(error, "Failed to send YamlResponse::Yaml: {}", e);
+                return;
+            }
         }
     }
 }
@@ -108,17 +101,10 @@ async fn fetch_resource_yaml<C: KubeClientRequest>(
         .find(|api| *api == kind)
         .ok_or_else(|| anyhow!("Can't get {} from API resource", kind))?;
     // json string data
-    let kind = api.name();
     let path = if api.is_namespaced() {
-        format!(
-            "{}/namespaces/{}/{}/{}",
-            api.group_version_url(),
-            ns,
-            kind,
-            name
-        )
+        format!("{}/{}", api.api_url_with_namespace(&ns), name)
     } else {
-        format!("{}/{}/{}", api.group_version_url(), kind, name)
+        format!("{}/{}", api.api_url(), name)
     };
 
     logger!(info, "Fetching resource [{}]", path);
